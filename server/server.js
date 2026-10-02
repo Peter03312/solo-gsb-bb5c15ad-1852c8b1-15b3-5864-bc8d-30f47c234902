@@ -10,6 +10,7 @@ const labels = require('./labels');
 const shipments = require('./shipments');
 const evaluation = require('./evaluation');
 const lots = require('./lots');
+const { normalizeCleanScope } = require('./cleaning');
 const { traceMaterial } = require('./trace');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -48,7 +49,7 @@ app.get('/api/state', (req, res) => {
     `SELECT e.id, e.code, e.name,
             COALESCE(r.allergens, '[]') AS allergens,
             COALESCE(r.paths_json, '{}') AS paths_json,
-            r.last_cleaned_at
+            r.last_cleaned_at, r.last_partial_cleaned_at
        FROM equipment e
        LEFT JOIN equipment_residue r ON r.equipment_id = e.id
       ORDER BY e.code`
@@ -56,17 +57,22 @@ app.get('/api/state', (req, res) => {
     id: e.id, code: e.code, name: e.name,
     allergens: JSON.parse(e.allergens),
     paths: JSON.parse(e.paths_json),
-    last_cleaned_at: e.last_cleaned_at
+    last_cleaned_at: e.last_cleaned_at,
+    last_partial_cleaned_at: e.last_partial_cleaned_at
   }));
 
   const events = db.prepare(
     `SELECT ev.id, ev.event_time, ev.type, ev.equipment_id, ev.note,
+            ev.clean_allergens,
             ev.batch_id, b.code AS batch_code,
             bo.allergens AS out_allergens,
-            bo.paths_json AS out_paths
+            bo.paths_json AS out_paths,
+            cr.residue_allergens AS clean_residue_allergens,
+            cr.residue_paths_json AS clean_residue_paths
        FROM events ev
        LEFT JOIN batches b ON b.id = ev.batch_id
        LEFT JOIN batch_outputs bo ON bo.batch_id = ev.batch_id
+       LEFT JOIN clean_results cr ON cr.event_id = ev.id
       ORDER BY ev.event_time, ev.id`
   ).all().map((ev) => ({
     id: ev.id,
@@ -74,6 +80,16 @@ app.get('/api/state', (req, res) => {
     type: ev.type,
     equipment_id: ev.equipment_id,
     note: ev.note,
+    // 清洗范围：null = 全清（旧 CLEAN 事件/旧请求）；数组 = 部分清洗本次已核实去除的过敏原。
+    clean_allergens: ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null,
+    clean_full: ev.type === 'CLEAN' && ev.clean_allergens == null,
+    // 清洗后仍残留（仅 CLEAN 事件）：全清为空数组；部分清洗为未清除的过敏原及其来源。
+    clean_residue_allergens: ev.type === 'CLEAN'
+      ? JSON.parse(ev.clean_residue_allergens || '[]')
+      : null,
+    clean_residue_paths: ev.type === 'CLEAN'
+      ? JSON.parse(ev.clean_residue_paths || '{}')
+      : null,
     batch_id: ev.batch_id,
     batch_code: ev.batch_code,
     out_allergens: ev.out_allergens ? JSON.parse(ev.out_allergens) : [],
@@ -369,8 +385,9 @@ app.post('/api/events', (req, res) => {
           .run(body.batch_code).lastInsertRowid;
       }
       const eid = d.prepare(
-        'INSERT INTO events (event_time, type, equipment_id, batch_id, note) VALUES (?,?,?,?,?)'
-      ).run(body.event_time, body.type, body.equipment_id, batchId, body.note).lastInsertRowid;
+        'INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note) VALUES (?,?,?,?,?,?)'
+      ).run(body.event_time, body.type, body.equipment_id, batchId,
+            body.type === 'CLEAN' ? body.clean_allergens_json : null, body.note).lastInsertRowid;
       if (body.type === 'PROCESS') {
         for (const inp of materialInputs) {
           d.prepare(
@@ -419,8 +436,9 @@ app.put('/api/events/:id', (req, res) => {
         }
       }
       d.prepare(
-        'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
-      ).run(body.event_time, body.equipment_id, body.note, existing.id);
+        'UPDATE events SET event_time=?, equipment_id=?, note=?, clean_allergens=? WHERE id=?'
+      ).run(body.event_time, body.equipment_id, body.note,
+            body.type === 'CLEAN' ? body.clean_allergens_json : null, existing.id);
     });
     res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { sendEventError(res, err); }
@@ -499,7 +517,18 @@ function normalizeEventBody(body, isUpdate = false) {
   const note = String(body.note || '').trim();
 
   const out = { type, event_time, equipment_id, note,
-    material_ids: [], material_inputs: undefined, ref_batch_ids: [] };
+    material_ids: [], material_inputs: undefined, ref_batch_ids: [],
+    clean_allergens: null, clean_allergens_json: null };
+
+  if (type === 'CLEAN') {
+    // 清洗范围（本轮新增）：
+    //   省略 clean_allergens（含 null）= 全清，旧 CLEAN 事件与旧请求语义不变；
+    //   数组 = 部分清洗，本次只清除指定过敏原的设备残留及来源，其余残留继续进入后续批次。
+    // 显式空集、非字符串或仅空白的名称一律拒绝；重复名称按一个处理。
+    const { scope, json } = normalizeCleanScope(body.clean_allergens);
+    out.clean_allergens = scope;
+    out.clean_allergens_json = json;
+  }
   if (type === 'PROCESS') {
     const batch_code = String(body.batch_code || '').trim();
     if (!batch_code) throw new Error('产出批次编码不能为空');

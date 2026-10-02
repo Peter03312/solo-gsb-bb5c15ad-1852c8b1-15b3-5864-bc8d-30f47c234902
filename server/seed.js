@@ -18,8 +18,8 @@ function seedIfEmpty() {
     );
     const insBatch = db.prepare('INSERT INTO batches (code) VALUES (?)');
     const insEvent = db.prepare(
-      `INSERT INTO events (event_time, type, equipment_id, batch_id, note)
-       VALUES (?,?,?,?,?)`
+      `INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note)
+       VALUES (?,?,?,?,?,?)`
     );
     const insInput = db.prepare(
       'INSERT INTO process_inputs (event_id, material_id, batch_id, material_lot_id) VALUES (?,?,?,?)'
@@ -55,18 +55,26 @@ function seedIfEmpty() {
     lotId('MILK-B', 'MILK-01', 'SUP-MILK-20260926-B', '诚信乳业', '9/26 到货全脂奶粉 B 批（供应商通报异常）', true);
     lotId('WHEAT-A', 'WHEAT-01', 'SUP-WHEAT-20260920-7', '北方粮贸', '面粉常规批');
     lotId('PEANUT-A', 'PEANUT-01', 'SUP-PNT-20260928-3', '鲁东花生', '花生碎批');
+    // LINE-C 部分清洗演示所用批号（均登记已知批号，避免与“批号未知”追溯演示混淆）。
+    lotId('MILK-C', 'MILK-01', 'SUP-MILK-20260924-C', '诚信乳业', '9/24 到货全脂奶粉 C 批');
+    lotId('EGG-A', 'EGG-01', 'SUP-EGG-20260927-1', '旭日蛋品', '全蛋液常规批');
+    lotId('SESAME-A', 'SESAME-01', 'SUP-SES-20260929-1', '瑞香油脂', '芝麻酱批');
 
     const lineA = insEquip.run('LINE-A', '烘焙A线').lastInsertRowid;
     const fryerB = insEquip.run('FRYER-B', '油炸B线').lastInsertRowid;
+    const lineC = insEquip.run('LINE-C', '裱花C线').lastInsertRowid;
 
-    ['BATCH-001', 'BATCH-002', 'BATCH-003', 'BATCH-004', 'BATCH-005']
+    ['BATCH-001', 'BATCH-002', 'BATCH-003', 'BATCH-004', 'BATCH-005',
+     'BATCH-PC1', 'BATCH-PC2', 'BATCH-PC3']
       .forEach((code) => { batchIds[code] = insBatch.run(code).lastInsertRowid; });
 
     const D = '2026-09-30T';
     const process = (time, equip, bid, note) =>
-      insEvent.run(D + time, 'PROCESS', equip, bid, note).lastInsertRowid;
-    const clean = (time, equip, note) =>
-      insEvent.run(D + time, 'CLEAN', equip, null, note).lastInsertRowid;
+      insEvent.run(D + time, 'PROCESS', equip, bid, null, note).lastInsertRowid;
+    // cleanScope：省略 = 全清；传入数组 = 部分清洗（本次已核实去除的过敏原）。
+    const clean = (time, equip, note, cleanScope) =>
+      insEvent.run(D + time, 'CLEAN', equip, null,
+        cleanScope ? JSON.stringify(cleanScope) : null, note).lastInsertRowid;
     const matInput = (eid, code, lotKey = null) =>
       insInput.run(eid, mats[code], null, lotKey ? lot[lotKey] : null);
     const batchInput = (eid, code) => insInput.run(eid, null, batchIds[code], null);
@@ -97,6 +105,27 @@ function seedIfEmpty() {
     matInput(e7, 'SALT-01');
 
     clean('15:00', lineA, '班后已核实清洗');
+
+    // ---- LINE-C：部分清洗演示（16:00 起）----
+    // 16:00 乳+蛋 → 17:00 部分清洗只核实去除“乳”（蛋残留保留）→
+    // 18:00 只投芝麻酱：BATCH-PC2 仍从设备残留并入“蛋”，加工后残留变为 蛋+芝麻；
+    // 19:00 再做只清“蛋”的部分清洗后，残留只剩芝麻：19:30 的 BATCH-PC3 仅含芝麻；
+    // 20:00 全清收尾。
+    const e8 = process('16:00', lineC, batchIds['BATCH-PC1'], '奶霜夹心（乳+蛋）');
+    matInput(e8, 'MILK-01', 'MILK-C');
+    matInput(e8, 'EGG-01', 'EGG-A');
+
+    clean('17:00', lineC, '部分清洗：仅核实去除乳残留（蛋残留保留，待复核）', ['乳']);
+
+    const e9 = process('18:00', lineC, batchIds['BATCH-PC2'], '芝麻味夹心（设备仍带蛋残留）');
+    matInput(e9, 'SESAME-01', 'SESAME-A');
+
+    clean('19:00', lineC, '部分清洗：核实去除蛋残留（残留仅剩芝麻）', ['蛋']);
+
+    const e10 = process('19:30', lineC, batchIds['BATCH-PC3'], '纯芝麻验证批（设备残留已无乳/蛋）');
+    matInput(e10, 'SESAME-01', 'SESAME-A');
+
+    clean('20:00', lineC, '班后已核实全清');
   });
   insertBase();
 

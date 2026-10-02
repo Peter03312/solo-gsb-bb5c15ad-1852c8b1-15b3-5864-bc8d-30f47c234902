@@ -7,6 +7,12 @@
 //   3) 同设备未清洗残留：加工后本批号留在设备残留中，被该设备上之后、下一次已核实
 //      清洗（CLEAN）之前的每一次加工并入——已核实清洗截断设备残留。
 //
+// 部分清洗（CLEAN 带 clean_allergens，仅清除指定过敏原）下设备传播按来源过敏原保留：
+//   尚有任一与该来源相关的过敏原未被清除，即不能沿设备残留排除该批号（含批号未知）；
+//   来源涉及过敏原全部在清洗范围内才截断该批号的设备传播；
+//   来源原料未登记过敏原时部分清洗不得据此排除批号，只有全清截断。
+//   直接投料与前序批次引用不受清洗影响。
+//
 // 命中分两类，受影响对象不漏报、也不会把无法排除的对象误列为安全：
 //   CONFIRMED  确定命中：存在一条可核实的传播链，其起点是“该原料 + 该批号”的直接投料；
 //   UNRESOLVED 因该原料批号未知而无法排除：传播链起点是“该原料批号未知”的投料
@@ -58,11 +64,14 @@ function traceMaterial(db, options) {
     throw new TraceError(400, 'INVALID_REQUEST', '请指定原料 material_id');
   }
   const material = db.prepare(
-    'SELECT id, code, name FROM materials WHERE id = ?'
+    'SELECT id, code, name, allergens FROM materials WHERE id = ?'
   ).get(material_id);
   if (!material) {
     throw new TraceError(404, 'MATERIAL_NOT_FOUND', `原料 #${material_id} 不存在`);
   }
+  // 目标（来源）原料当前登记的过敏原：部分清洗只有把该集合全部覆盖时，才能截断
+  // 该原料批号的设备传播；集合为空（如食用盐）时部分清洗无据可依，不得排除批号。
+  const sourceAllergens = JSON.parse(material.allergens || '[]');
 
   let pathLimit = DEFAULT_PATH_LIMIT;
   if (options.path_limit !== undefined && options.path_limit !== null && options.path_limit !== '') {
@@ -116,8 +125,14 @@ function traceMaterial(db, options) {
   const equipment = new Map(
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
+  // 与批号桶并行维护的“过敏原级别”设备残留/批次产出（复用重算引擎语义），
+  // 用于判定部分清洗是否把来源原料涉及的过敏原全部清除。
+  const materialAllergens = new Map(
+    db.prepare('SELECT id, allergens FROM materials').all()
+      .map((m) => [m.id, JSON.parse(m.allergens || '[]')])
+  );
   const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id
+    `SELECT id, event_time, type, equipment_id, batch_id, clean_allergens
        FROM events ORDER BY event_time, id`
   ).all();
   const inputsByEvent = new Map();
@@ -138,14 +153,50 @@ function traceMaterial(db, options) {
   }
   const lastCleanAt = new Map();
 
+  // 过敏原级别并行状态：alBatch: Set<allergens>；alRes: 设备残留过敏原集合。
+  const alBatch = new Map();
+  const alRes = new Map();
+  for (const qid of equipment.keys()) alRes.set(qid, new Set());
+
   const knownBase = lot ? baseKnown(material, lot) : null;
   const unknownBase = baseUnknown(material);
 
   for (const ev of events) {
     if (ev.type === 'CLEAN') {
-      // 已核实清洗截断该设备的残留（所有原料的残留一并清空，这里只追踪本原料）。
-      residue.set(ev.equipment_id, { confirmed: bucket(), unresolved: bucket() });
-      lastCleanAt.set(ev.equipment_id, ev.event_time);
+      const scope = ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null;
+      const alEq = alRes.get(ev.equipment_id) || new Set();
+      if (scope === null) {
+        // 全清：清空该设备残留（所有原料的残留一并清空，这里只追踪本原料）。
+        residue.set(ev.equipment_id, { confirmed: bucket(), unresolved: bucket() });
+        alEq.clear();
+        lastCleanAt.set(ev.equipment_id, ev.event_time);
+        continue;
+      }
+      // 部分清洗：过敏原级别先按范围清除。
+      for (const a of scope) alEq.delete(a);
+      // 本批号（或批号未知）的设备传播是否被截断：
+      //   来源原料未登记过敏原 -> 无据可依，部分清洗不能排除批号（保守保留）；
+      //   否则来源涉及的过敏原全部在本次清洗范围内才截断；尚有任一未清除则保留传播。
+      const sourceCovered = sourceAllergens.length > 0 &&
+        sourceAllergens.every((a) => scope.includes(a));
+      const cur = residue.get(ev.equipment_id);
+      const lotPresent = cur.confirmed.chains.size > 0 || cur.unresolved.chains.size > 0;
+      if (!sourceCovered && lotPresent) {
+        // 不能排除：批号残留链原样保留（继续向后续加工传播），并追加“部分清洗未截断”依据。
+        const tag = `（部分清洗未截断：${material.name}(${material.code})相关过敏原未全部清除，已核实清除仅：${scope.join('、') || '（空）'}）`;
+        const next = { confirmed: bucket(), unresolved: bucket() };
+        for (const chain of cur.confirmed.chains) {
+          addChain(next.confirmed, `${chain}${tag}`, pathLimit);
+        }
+        for (const chain of cur.unresolved.chains) {
+          addChain(next.unresolved, `${chain}${tag}`, pathLimit);
+        }
+        residue.set(ev.equipment_id, next);
+      } else {
+        // 全清式截断（针对本原料）：来源过敏原全部被覆盖，本批号的设备残留到此为止。
+        residue.set(ev.equipment_id, { confirmed: bucket(), unresolved: bucket() });
+      }
+      // 注意：部分清洗不更新 lastCleanAt（最后“全清”时间语义不变）。
       continue;
     }
     if (!ev.batch_id) continue; // 异常数据由提交校验拦截
@@ -193,6 +244,19 @@ function traceMaterial(db, options) {
     for (const chain of carried.unresolved.chains) addChain(out.unresolved, chain, pathLimit);
 
     batchState.set(ev.batch_id, { ...out, eventTime: ev.event_time, equipment_id: ev.equipment_id });
+
+    // 过敏原级别并行推导（与重算引擎一致：原料 ∪ 引用批次 ∪ 设备残留），
+    // 供部分清洗判定“来源过敏原是否已全部清除”。
+    const alOut = new Set(alRes.get(ev.equipment_id) || []);
+    for (const inp of inputs) {
+      if (inp.material_id != null) {
+        for (const a of (materialAllergens.get(inp.material_id) || [])) alOut.add(a);
+      } else if (inp.ref_batch_id != null && alBatch.has(inp.ref_batch_id)) {
+        for (const a of alBatch.get(inp.ref_batch_id)) alOut.add(a);
+      }
+    }
+    alBatch.set(ev.batch_id, alOut);
+    alRes.set(ev.equipment_id, new Set(alOut));
 
     // 更新设备残留：本次新带入的链追加设备残留标记，原有残留链原样保留。
     const nextRes = { confirmed: bucket(), unresolved: bucket() };

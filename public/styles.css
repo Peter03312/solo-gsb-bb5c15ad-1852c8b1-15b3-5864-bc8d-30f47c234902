@@ -313,3 +313,8 @@ ul.trace-paths li { margin: 2px 0; font-size: 12px; }
 li.trace-trunc { color: #888; list-style: none; margin-left: -16px; }
 .trace-ships { margin-top: 6px; font-size: 12.5px; }
 .trace-residue { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+
+/* 部分清洗（清洗范围录入与展示） */
+.clean-mode { display: flex; gap: 6px; align-items: center; margin: 4px 0; font-size: 13px; }
+#evCleanAllergens { margin-top: 6px; width: 100%; }
+#evCleanAllergens:disabled { background: #f1f4f6; color: #9aa8b2; }

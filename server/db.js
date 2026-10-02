@@ -59,6 +59,11 @@ function initSchema(d) {
     type TEXT NOT NULL CHECK (type IN ('PROCESS','CLEAN')),
     equipment_id INTEGER NOT NULL REFERENCES equipment(id),
     batch_id INTEGER UNIQUE REFERENCES batches(id), -- PROCESS 时唯一
+    -- CLEAN 事件本次已核实去除的过敏原集合（规范化 JSON 数组）：
+    --   NULL/缺省 = 全清（旧 CLEAN 事件与旧请求的既有语义）；
+    --   非空数组 = 部分清洗，仅清除指定过敏原的设备残留与来源，其余残留继续进入后续批次。
+    -- 显式空数组在写入校验阶段即拒绝（不允许落库）。
+    clean_allergens TEXT,
     note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -87,12 +92,24 @@ function initSchema(d) {
     paths_json TEXT NOT NULL DEFAULT '[]'
   );
 
-  -- 设备当前残留（最后一次已核实清洗之后的累积）
+  -- 设备当前残留（最后一次已核实清洗之后的累积）。
+  -- last_cleaned_at      ：最后一次“全清”的时间（语义不变；部分清洗不更新该字段）。
+  -- last_partial_cleaned_at：最后一次“部分清洗”的时间（仅清除部分过敏原，设备仍有残留）。
   CREATE TABLE IF NOT EXISTS equipment_residue (
     equipment_id INTEGER PRIMARY KEY REFERENCES equipment(id) ON DELETE CASCADE,
     allergens TEXT NOT NULL DEFAULT '[]',
     paths_json TEXT NOT NULL DEFAULT '[]',
-    last_cleaned_at TEXT
+    last_cleaned_at TEXT,
+    last_partial_cleaned_at TEXT
+  );
+
+  -- CLEAN 事件的派生结果（随重算全量刷新）：
+  -- 记录部分清洗“清洗后仍残留”的过敏原及来源路径，供页面展示清洗范围与变化依据。
+  -- 全清事件的残留集合恒为空，也保留一行（全清/部分清洗类型由 events.clean_allergens 判定）。
+  CREATE TABLE IF NOT EXISTS clean_results (
+    event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    residue_allergens TEXT NOT NULL DEFAULT '[]',
+    residue_paths_json TEXT NOT NULL DEFAULT '{}'
   );
 
   CREATE TABLE IF NOT EXISTS releases (
@@ -224,6 +241,19 @@ function initSchema(d) {
     );
   }
   d.exec('CREATE INDEX IF NOT EXISTS idx_process_inputs_lot ON process_inputs(material_lot_id)');
+
+  // events.clean_allergens：CLEAN 事件本次已核实去除的过敏原集合；
+  // 旧库既有 CLEAN 事件全部为 NULL（全清），语义不变。
+  const eventCols = d.prepare("PRAGMA table_info(events)").all().map((c) => c.name);
+  if (!eventCols.includes('clean_allergens')) {
+    d.exec('ALTER TABLE events ADD COLUMN clean_allergens TEXT');
+  }
+
+  // equipment_residue.last_partial_cleaned_at：最后一次部分清洗时间（旧库无记录）。
+  const residueCols = d.prepare("PRAGMA table_info(equipment_residue)").all().map((c) => c.name);
+  if (!residueCols.includes('last_partial_cleaned_at')) {
+    d.exec('ALTER TABLE equipment_residue ADD COLUMN last_partial_cleaned_at TEXT');
+  }
 }
 
 module.exports = { getDb, initDbFile, initSchema, DB_PATH };

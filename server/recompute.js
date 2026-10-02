@@ -3,7 +3,10 @@
 //   加工：产出过敏原 = 原料输入 ∪ 引用批次的产出 ∪ 设备当前残留；
 //         随后设备残留更新为本次产出的过敏原（新鲜来源追加“设备残留”标记，
 //         已在残留中的路径原样保留）。
-//   已核实清洗：清空该设备残留。
+//   已核实清洗：
+//     全清（clean_allergens 缺省/NULL）—— 清空该设备残留；
+//     部分清洗（clean_allergens 为非空过敏原集合）—— 只清除指定过敏原的设备残留
+//       及其来源路径，其余过敏原残留原样保留并继续进入该设备后续批次。
 // 回放后刷新派生表，并按“登记当时的过敏原集合”核对放行记录，
 // 集合不同的有效放行置为失效并记录原因；
 // 进而永久停用不再一致的标签卷，并把分配过这些停用卷的出货单置为待评估。
@@ -35,7 +38,7 @@ function recompute(db) {
   );
 
   const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id, note
+    `SELECT id, event_time, type, equipment_id, batch_id, note, clean_allergens
        FROM events ORDER BY event_time, id`
   ).all();
 
@@ -49,17 +52,36 @@ function recompute(db) {
   // 设备状态：allergen -> Set<路径>
   const residue = new Map();
   const lastCleanAt = new Map();
+  const lastPartialCleanAt = new Map();
   for (const qid of equipment.keys()) residue.set(qid, new Map());
 
   // 批次产出：allergen -> Set<路径>
   const batchResult = new Map();
 
+  // CLEAN 事件清洗后的残留快照（部分清洗：仅去除指定过敏原后的剩余；全清：空）
+  const cleanAfter = new Map();
+
   for (const ev of events) {
     const eqCode = (equipment.get(ev.equipment_id) || {}).code || `#${ev.equipment_id}`;
 
     if (ev.type === 'CLEAN') {
-      residue.set(ev.equipment_id, new Map());
-      lastCleanAt.set(ev.equipment_id, ev.event_time);
+      const scope = ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null;
+      if (scope === null) {
+        // 全清：清空该设备全部残留（旧 CLEAN 事件与省略清洗范围的请求语义不变）。
+        residue.set(ev.equipment_id, new Map());
+        lastCleanAt.set(ev.equipment_id, ev.event_time);
+      } else {
+        // 部分清洗：仅去除本次已核实清除的过敏原（含其来源路径），其余残留保留
+        // 并继续进入后续批次；last_cleaned_at（最后全清时间）不更新。
+        const removed = new Set(scope);
+        const kept = new Map();
+        for (const [a, paths] of (residue.get(ev.equipment_id) || new Map()).entries()) {
+          if (!removed.has(a)) kept.set(a, new Set(paths));
+        }
+        residue.set(ev.equipment_id, kept);
+        lastPartialCleanAt.set(ev.equipment_id, ev.event_time);
+      }
+      cleanAfter.set(ev.id, residue.get(ev.equipment_id) || new Map());
       continue;
     }
 
@@ -137,12 +159,13 @@ function recompute(db) {
 
   // ---- 持久化设备残留 ----
   const upRes = db.prepare(
-    `INSERT INTO equipment_residue (equipment_id, allergens, paths_json, last_cleaned_at)
-     VALUES (@equipment_id, @allergens, @paths_json, @last_cleaned_at)
+    `INSERT INTO equipment_residue (equipment_id, allergens, paths_json, last_cleaned_at, last_partial_cleaned_at)
+     VALUES (@equipment_id, @allergens, @paths_json, @last_cleaned_at, @last_partial_cleaned_at)
      ON CONFLICT(equipment_id) DO UPDATE SET
        allergens = excluded.allergens,
        paths_json = excluded.paths_json,
-       last_cleaned_at = excluded.last_cleaned_at`
+       last_cleaned_at = excluded.last_cleaned_at,
+       last_partial_cleaned_at = excluded.last_partial_cleaned_at`
   );
   for (const qid of equipment.keys()) {
     const map = residue.get(qid) || new Map();
@@ -153,7 +176,25 @@ function recompute(db) {
       equipment_id: qid,
       allergens: JSON.stringify(allergens),
       paths_json: JSON.stringify(pathsObj),
-      last_cleaned_at: lastCleanAt.get(qid) || null
+      last_cleaned_at: lastCleanAt.get(qid) || null,
+      last_partial_cleaned_at: lastPartialCleanAt.get(qid) || null
+    });
+  }
+
+  // ---- 持久化清洗事件结果（清洗后残留与来源，全清为空；先整表刷新为最新合法时间线）----
+  db.prepare('DELETE FROM clean_results').run();
+  const upClean = db.prepare(
+    `INSERT INTO clean_results (event_id, residue_allergens, residue_paths_json)
+     VALUES (@event_id, @residue_allergens, @residue_paths_json)`
+  );
+  for (const [eid, map] of cleanAfter.entries()) {
+    const allergens = [...map.keys()].sort((a, b) => a.localeCompare(b, 'zh'));
+    const pathsObj = {};
+    for (const a of allergens) pathsObj[a] = [...map.get(a)];
+    upClean.run({
+      event_id: eid,
+      residue_allergens: JSON.stringify(allergens),
+      residue_paths_json: JSON.stringify(pathsObj)
     });
   }
 

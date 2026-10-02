@@ -17,6 +17,7 @@ const Database = require('better-sqlite3');
 const { initSchema } = require('./db');
 const { validateAll } = require('./validation');
 const { recompute } = require('./recompute');
+const { normalizeCleanScope } = require('./cleaning');
 
 const PREVIEW_TTL_MS = 30 * 60 * 1000; // 预演版本有效期 30 分钟
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/;
@@ -103,6 +104,19 @@ function normalizeChanges(rawChanges) {
       }
       const note = String(ch.note || '').trim();
       const norm = { op, event_id, type, event_time, equipment_id, note };
+      if (type === 'CLEAN') {
+        // CLEAN 更正支持清洗范围：省略 = 全清（旧请求语义）；数组 = 部分清洗。
+        // 显式空集/非字符串/空白名称在预演阶段即以 INVALID_REQUEST 逐条拒绝。
+        try {
+          const { scope } = normalizeCleanScope(
+            ch.clean_allergens, `${where}.clean_allergens`
+          );
+          norm.clean_allergens = scope;
+        } catch (e) {
+          errors.push(e.message);
+          return;
+        }
+      }
       if (type === 'PROCESS') {
         const batch_code = String(ch.batch_code || '').trim();
         if (!batch_code) {
@@ -197,11 +211,21 @@ function normalizeChanges(rawChanges) {
       }
       seenInsertKey.add(client_key);
     }
+    let cleanScope = null;
+    try {
+      ({ scope: cleanScope } = normalizeCleanScope(
+        ch.clean_allergens, `${where}.clean_allergens`
+      ));
+    } catch (e) {
+      errors.push(e.message);
+      return;
+    }
     changes.push({
       op: 'insert_clean',
       client_key,
       event_time,
       equipment_id,
+      clean_allergens: cleanScope,
       note: String(ch.note || '').trim()
     });
   });
@@ -249,6 +273,9 @@ function publicChanges(changes) {
             return o;
           });
         }
+      } else if (c.type === 'CLEAN') {
+        // null（全清）与数组（部分清洗范围）均原样回显，便于确认应用时逐字比对。
+        out.clean_allergens = c.clean_allergens === undefined ? null : c.clean_allergens;
       }
       return out;
     }
@@ -256,6 +283,7 @@ function publicChanges(changes) {
       op: c.op, event_time: c.event_time, equipment_id: c.equipment_id, note: c.note
     };
     if (c.client_key !== null) out.client_key = c.client_key;
+    out.clean_allergens = c.clean_allergens === undefined ? null : c.clean_allergens;
     return out;
   });
 }
@@ -322,7 +350,7 @@ const FINGERPRINT_SQL = [
   'SELECT id, code, name, allergens FROM materials ORDER BY id',
   'SELECT id, material_id, lot_code, supplier, note, status, flagged_reason, created_at FROM material_lots ORDER BY id',
   'SELECT id, code, name FROM equipment ORDER BY id',
-  'SELECT id, event_time, type, equipment_id, batch_id, note FROM events ORDER BY id',
+  'SELECT id, event_time, type, equipment_id, batch_id, clean_allergens, note FROM events ORDER BY id',
   'SELECT id, code FROM batches ORDER BY id',
   'SELECT id, event_id, material_id, batch_id, material_lot_id FROM process_inputs ORDER BY id',
   `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status,
@@ -363,12 +391,14 @@ function takeSnapshot(db) {
 
   const residues = new Map();
   db.prepare(
-    `SELECT e.id, e.code, COALESCE(r.allergens,'[]') AS allergens, r.last_cleaned_at
+    `SELECT e.id, e.code, COALESCE(r.allergens,'[]') AS allergens,
+            r.last_cleaned_at, r.last_partial_cleaned_at
        FROM equipment e LEFT JOIN equipment_residue r ON r.equipment_id = e.id`
   ).all().forEach((e) => residues.set(e.id, {
     equipment_id: e.id, equipment_code: e.code,
     allergens: JSON.parse(e.allergens),
-    last_cleaned_at: e.last_cleaned_at || null
+    last_cleaned_at: e.last_cleaned_at || null,
+    last_partial_cleaned_at: e.last_partial_cleaned_at || null
   }));
 
   const releases = new Map();
@@ -383,7 +413,25 @@ function takeSnapshot(db) {
     status: r.status, invalid_reason: r.invalid_reason
   }));
 
-  return { batches, residues, releases };
+  // CLEAN 事件：清洗范围（null=全清 / 数组=部分清洗）与清洗后残留（变化依据）。
+  const cleans = new Map();
+  db.prepare(
+    `SELECT ev.id, ev.event_time, ev.equipment_id, ev.clean_allergens,
+            eq.code AS equipment_code,
+            COALESCE(cr.residue_allergens, '[]') AS residue_allergens
+       FROM events ev
+       JOIN equipment eq ON eq.id = ev.equipment_id
+       LEFT JOIN clean_results cr ON cr.event_id = ev.id
+      WHERE ev.type = 'CLEAN'`
+  ).all().forEach((c) => cleans.set(c.id, {
+    id: c.id, event_time: c.event_time, equipment_id: c.equipment_id,
+    equipment_code: c.equipment_code,
+    clean_full: c.clean_allergens == null,
+    clean_allergens: c.clean_allergens ? JSON.parse(c.clean_allergens) : null,
+    residue_allergens: JSON.parse(c.residue_allergens || '[]')
+  }));
+
+  return { batches, residues, releases, cleans };
 }
 
 function sortZh(arr) {
@@ -422,7 +470,11 @@ function diffSnapshots(before, after) {
     const beforeA = sortZh(bef ? bef.allergens.slice() : []);
     const afterA = sortZh(aft.allergens.slice());
     const cleanMoved = bef && bef.last_cleaned_at !== aft.last_cleaned_at;
-    if (!cleanMoved && sameSet(beforeA, afterA)) continue;
+    // 部分清洗不移除全部残留，但会改变残留集合（或仅留下“部分清洗发生过”的依据），
+    // 同样作为差异返回，供页面展示变化依据。
+    const partialCleanMoved = bef &&
+      bef.last_partial_cleaned_at !== aft.last_partial_cleaned_at;
+    if (!cleanMoved && !partialCleanMoved && sameSet(beforeA, afterA)) continue;
     equipment_residue.push({
       equipment_id: id, equipment_code: aft.equipment_code,
       before_allergens: beforeA,
@@ -430,7 +482,9 @@ function diffSnapshots(before, after) {
       added: sortZh(afterA.filter((a) => !beforeA.includes(a))),
       removed: sortZh(beforeA.filter((a) => !afterA.includes(a))),
       before_last_cleaned_at: bef ? bef.last_cleaned_at : null,
-      after_last_cleaned_at: aft.last_cleaned_at
+      after_last_cleaned_at: aft.last_cleaned_at,
+      before_last_partial_cleaned_at: bef ? bef.last_partial_cleaned_at : null,
+      after_last_partial_cleaned_at: aft.last_partial_cleaned_at
     });
   }
   equipment_residue.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code, 'zh'));
@@ -453,17 +507,55 @@ function diffSnapshots(before, after) {
   releases.sort((a, b) =>
     a.released_at.localeCompare(b.released_at) || a.release_id - b.release_id);
 
+  // ---- CLEAN 事件：清洗范围（全清/部分清洗）与清洗后残留变化（变化依据）----
+  // 应用前存在的事件按 id 比对；新插入的清洗事件（影子库 id 不在 before 中）单列。
+  const clean_events = [];
+  for (const [id, aft] of after.cleans) {
+    const bef = before.cleans.get(id);
+    const item = {
+      clean_event_id: id,
+      inserted: !bef,
+      event_time: aft.event_time,
+      equipment_id: aft.equipment_id,
+      equipment_code: aft.equipment_code,
+      before_full: bef ? bef.clean_full : null,
+      after_full: aft.clean_full,
+      before_allergens: bef ? bef.clean_allergens : null,
+      after_allergens: aft.clean_allergens,
+      before_residue_allergens: bef ? sortZh(bef.residue_allergens.slice()) : null,
+      after_residue_allergens: sortZh(aft.residue_allergens.slice())
+    };
+    if (!bef) {
+      clean_events.push(item);
+      continue;
+    }
+    const scopeChanged = bef.clean_full !== aft.clean_full ||
+      !sameSet(
+        bef.clean_allergens ? bef.clean_allergens.slice() : [],
+        aft.clean_allergens ? aft.clean_allergens.slice() : []
+      );
+    const residueChanged = !sameSet(bef.residue_allergens, aft.residue_allergens);
+    if (scopeChanged || residueChanged || bef.event_time !== aft.event_time) {
+      clean_events.push(item);
+    }
+  }
+  clean_events.sort((a, b) =>
+    String(a.event_time || '').localeCompare(String(b.event_time || '')) ||
+    a.clean_event_id - b.clean_event_id);
+
   return {
     summary: {
       batches_changed: batches.length,
       equipment_residue_changed: equipment_residue.length,
       releases_will_invalidate: releases.filter((r) =>
         r.before_status === 'ACTIVE' && r.after_status === 'INVALIDATED').length,
-      releases_changed: releases.length
+      releases_changed: releases.length,
+      clean_events_changed: clean_events.length
     },
     batches,
     equipment_residue,
-    releases
+    releases,
+    clean_events
   };
 }
 
@@ -559,10 +651,10 @@ function resolveChangeRefs(db, changes) {
 // ---------- 将变更写入给定库（影子库 或 正式事务） ----------
 function applyChangesTo(db, resolved) {
   const insEvent = db.prepare(
-    'INSERT INTO events (event_time, type, equipment_id, batch_id, note) VALUES (?,?,?,?,?)'
+    'INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note) VALUES (?,?,?,?,?,?)'
   );
   const updEvent = db.prepare(
-    'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
+    'UPDATE events SET event_time=?, equipment_id=?, note=?, clean_allergens=? WHERE id=?'
   );
   const updBatchCode = db.prepare('UPDATE batches SET code=? WHERE id=?');
   const delInputs = db.prepare('DELETE FROM process_inputs WHERE event_id=?');
@@ -587,12 +679,17 @@ function applyChangesTo(db, resolved) {
       }
       for (const bid of c.ref_batch_ids) insBatchInput.run(c.event_id, bid);
     }
-    updEvent.run(c.event_time, c.equipment_id, c.note, c.event_id);
+    updEvent.run(c.event_time, c.equipment_id, c.note,
+      c.type === 'CLEAN' ? (c.clean_allergens == null ? null : JSON.stringify(c.clean_allergens)) : null,
+      c.event_id);
   }
   const inserted = [];
   for (const c of resolved) {
     if (c.op !== 'insert_clean') continue;
-    const id = insEvent.run(c.event_time, 'CLEAN', c.equipment_id, null, c.note).lastInsertRowid;
+    const id = insEvent.run(
+      c.event_time, 'CLEAN', c.equipment_id, null,
+      c.clean_allergens == null ? null : JSON.stringify(c.clean_allergens), c.note
+    ).lastInsertRowid;
     inserted.push({ client_key: c.client_key, event_id: id });
   }
   return inserted;
@@ -615,10 +712,11 @@ function openShadow(sourceDb) {
   copy('material_lots', 'id,material_id,lot_code,supplier,note,status,flagged_reason,created_at');
   copy('equipment', 'id,code,name');
   copy('batches', 'id,code');
-  copy('events', 'id,event_time,type,equipment_id,batch_id,note');
+  copy('events', 'id,event_time,type,equipment_id,batch_id,clean_allergens,note');
   copy('process_inputs', 'id,event_id,material_id,batch_id,material_lot_id');
   copy('batch_outputs', 'batch_id,allergens,paths_json');
-  copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at');
+  copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at,last_partial_cleaned_at');
+  copy('clean_results', 'event_id,residue_allergens,residue_paths_json');
   copy('releases', 'id,batch_id,released_at,released_by,snapshot_allergens,status,invalid_reason,created_event_seq');
   copy('label_rolls', 'id,roll_code,batch_id,release_id,print_qty,applied_qty,void_qty,revision,allergen_set,registered_at,registered_by,status,retired_reason');
   copy('label_roll_usages', 'id,roll_id,used_at,applied_qty,void_qty,expected_revision,used_by');

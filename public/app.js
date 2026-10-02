@@ -86,7 +86,8 @@ function renderResidue() {
   $('#residueCards').innerHTML = state.equipment.map((q) => `
     <div class="residue-card">
       <h4>${esc(q.name)} <span class="batch-meta">(${esc(q.code)})</span></h4>
-      <div class="residue-meta">最后已核实清洗：${q.last_cleaned_at ? esc(fmtTime(q.last_cleaned_at)) : '无记录'}</div>
+      <div class="residue-meta">最后全清：${q.last_cleaned_at ? esc(fmtTime(q.last_cleaned_at)) : '无记录'}</div>
+      <div class="residue-meta">最后部分清洗：${q.last_partial_cleaned_at ? esc(fmtTime(q.last_partial_cleaned_at)) : '无记录'}</div>
       ${q.allergens.length
         ? `<div class="tag-row">${allergenTags(q.allergens, '')}</div>
            <details><summary>查看残留来源路径（${Object.values(q.paths).reduce((n, p) => n + p.length, 0)} 条）</summary>
@@ -346,7 +347,22 @@ function renderEvents() {
         }).join('、') : '—'}
           ｜<b>引用批次：</b>${refs.length ? refs.map((r) => esc(r.ref_batch_code)).join('、') : '—'}</div>`;
     } else {
-      body = `<div class="event-inputs"><b>已核实清洗：</b>清空设备残留${ev.note ? `｜${esc(ev.note)}` : ''}</div>`;
+      const scope = ev.clean_allergens;
+      const after = ev.clean_residue_allergens || [];
+      if (scope) {
+        body = `
+        <div class="event-inputs"><b>部分清洗：</b>本次已核实去除
+          <span class="tag-row" style="display:inline-flex">${allergenTags(scope, '')}</span>${ev.note ? `｜${esc(ev.note)}` : ''}</div>
+        <div class="event-inputs">清洗后设备残留：
+          ${after.length
+            ? `<span class="tag-row" style="display:inline-flex">${allergenTags(after, '')}</span>
+               （其余过敏原残留继续进入后续批次）`
+            : '<span class="tag none">无残留（本次范围内过敏原已全部清除）</span>'}
+        </div>
+        ${after.length ? `<details><summary>查看清洗后残留来源路径（变化依据）</summary>${renderPaths(ev.clean_residue_paths)}</details>` : ''}`;
+      } else {
+        body = `<div class="event-inputs"><b>已核实全清：</b>清空设备全部残留${ev.note ? `｜${esc(ev.note)}` : ''}</div>`;
+      }
     }
     return `
     <div class="event-item ${ev.type === 'CLEAN' ? 'clean' : ''}">
@@ -418,6 +434,8 @@ function openEventModal() {
   form.event_time.value = new Date().toISOString().slice(0, 16);
   fillEventModalOptions(null);
   $('#processFields').style.display = form.type.value === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = form.type.value !== 'CLEAN';
+  syncCleanMode();
   $('#eventModal').classList.remove('hidden');
 }
 window.openEventModal = openEventModal;
@@ -429,7 +447,22 @@ $('#btnNewEventTop').onclick = () => {
 $('#eventCancel').onclick = () => $('#eventModal').classList.add('hidden');
 $('#evType').onchange = (e) => {
   $('#processFields').style.display = e.target.value === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = e.target.value !== 'CLEAN';
+  syncCleanMode();
 };
+
+// 清洗范围弹窗联动：全清禁用范围输入；部分清洗启用。
+function syncCleanMode() {
+  const f = $('#eventForm');
+  const isClean = f.type.value === 'CLEAN';
+  if (!isClean) return;
+  const partial = f.clean_mode.value === 'partial';
+  $('#evCleanAllergens').disabled = !partial;
+  if (!partial) $('#evCleanAllergens').value = '';
+}
+$('#eventForm').addEventListener('change', (e) => {
+  if (e.target.name === 'clean_mode') syncCleanMode();
+});
 $('#eventForm').addEventListener('input', (e) => {
   if (e.target.name === 'event_time') refreshRefBatchOptions();
 });
@@ -527,6 +560,13 @@ window.editEvent = function (id) {
   form.note.value = ev.note || '';
   form.batch_code.value = ev.batch_code || '';
   $('#processFields').style.display = ev.type === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = ev.type !== 'CLEAN';
+  if (ev.type === 'CLEAN') {
+    const partial = Array.isArray(ev.clean_allergens) && ev.clean_allergens.length > 0;
+    form.clean_mode.value = partial ? 'partial' : 'full';
+    $('#evCleanAllergens').value = partial ? ev.clean_allergens.join(',') : '';
+  }
+  syncCleanMode();
   fillEventModalOptions(ev);
   $('#eventModal').classList.remove('hidden');
 };
@@ -554,6 +594,21 @@ $('#eventForm').onsubmit = async (e) => {
     material_inputs: materialInputs,
     ref_batch_ids: $$('#evBatches input:checked').map((x) => parseInt(x.value, 10))
   };
+  if (f.type.value === 'CLEAN') {
+    if (f.clean_mode.value === 'partial') {
+      const scope = f.clean_allergens_text.value
+        .split(/[,，;；]/).map((s) => s.trim()).filter(Boolean);
+      // 显式空集会被后端拒绝（全清请选择“全清”）；前端先给出明确提示。
+      if (!scope.length) {
+        notice('error', '部分清洗必须填写至少一个已核实去除的过敏原；若要全清请选择“全清”');
+        return;
+      }
+      body.clean_allergens = scope;
+    }
+    delete body.batch_code;
+    delete body.material_inputs;
+    delete body.ref_batch_ids;
+  }
   try {
     let r;
     if (editingEventId) {
@@ -1249,7 +1304,7 @@ $('#traceForm').onsubmit = async (e) => {
         <div class="trace-residue">${r.equipment_residue.map((eq) => `
           <div class="residue-card">
             <h4>${esc(eq2(eq))}</h4>
-            <div class="batch-meta">最后已核实清洗：${eq.last_cleaned_at ? esc(fmtTime(eq.last_cleaned_at)) : '无记录'}</div>
+            <div class="batch-meta">最后全清：${eq.last_cleaned_at ? esc(fmtTime(eq.last_cleaned_at)) : '无记录'}</div>
             ${eq.confirmed_chains.length ? `<div><b>确定：</b><ul class="trace-paths">${eq.confirmed_chains.map((c) => `<li class="${traceChainClass(c)}">${esc(c)}</li>`).join('')}</ul></div>` : ''}
             ${eq.unresolved_chains.length ? `<div><b>无法排除：</b><ul class="trace-paths">${eq.unresolved_chains.map((c) => `<li class="${traceChainClass(c)}">${esc(c)}</li>`).join('')}</ul></div>` : ''}
           </div>`).join('')}</div>` : ''}`;

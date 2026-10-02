@@ -86,7 +86,10 @@
     </div>
     <p class="section-hint">
       供应商通报某原料供应批号异常时，选择<b>原料与供应批号</b>查询可能流向：系统沿
-      <b>直接投料 → 前序批次引用 → 同设备未清洗残留</b>逐时传播，<b>已核实清洗</b>截断设备残留。
+      <b>直接投料 → 前序批次引用 → 同设备未清洗残留</b>逐时传播，<b>已核实全清</b>截断设备残留。
+      <b>部分清洗</b>（CLEAN 事件带清洗范围）下，只要来源原料涉及的过敏原尚有任一未被清除，
+      就不能沿设备残留排除该批号或批号未知的流向；来源过敏原全部在清洗范围内才截断该批号传播；
+      来源原料无登记过敏原时部分清洗不得据此排除批号，只有全清截断；清洗不抹去直接投料与批次引用。
       结果分为<b>确定命中</b>与<b>因批号未知而无法排除</b>两类（无法排除≠安全，不会误列为安全），
       并给出每条传播依据与关联出货单。选择“批号未知（无法排除）”可只查该原料批号未知的投料流向。
       追溯<b>不自动改变</b>放行、标签卷、出货与处置结论；事件更正/删除后按最新合法时间线重新计算。
@@ -194,6 +197,21 @@
           <label>引用此前批次</label>
           <div id="evBatches" class="check-grid"></div>
           <small class="hint">只能引用产出时间早于本事件时间的批次；引用未来批次或形成循环会被拒绝。</small>
+        </div>
+      </div>
+      <div id="cleanFields" hidden>
+        <div class="form-row align-top">
+          <label>清洗范围</label>
+          <div>
+            <label class="clean-mode"><input type="radio" name="clean_mode" value="full" checked>
+              全清（清空该设备全部过敏原残留；旧 CLEAN 事件的默认语义）</label>
+            <label class="clean-mode"><input type="radio" name="clean_mode" value="partial">
+              部分清洗（仅清除下列已核实过敏原的设备残留及来源，其余残留继续进入后续批次）</label>
+            <input type="text" name="clean_allergens_text" id="evCleanAllergens"
+                   placeholder="逗号分隔，如：乳,蛋（重复名称按一个处理；显式空集不允许）">
+            <small class="hint">供应批号追溯时：部分清洗只有覆盖来源原料涉及的全部过敏原，才截断该批号的设备传播；
+              原料未登记过敏原时只有全清能截断。直接投料与批次引用不受清洗影响。</small>
+          </div>
         </div>
       </div>
       <div class="form-row">

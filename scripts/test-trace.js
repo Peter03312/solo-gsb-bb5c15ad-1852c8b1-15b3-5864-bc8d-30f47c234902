@@ -88,11 +88,11 @@ async function main() {
     // ---------- 1. 演示批号档案 ----------
     console.log('1) 演示数据含供应批号（MILK-A 正常 / MILK-B 已通报 FLAGGED）');
     r = await api('GET', '/api/material-lots');
-    check('批号列表 4 条', r.status === 200 && r.json.length === 4, r.json);
+    check('批号列表 7 条', r.status === 200 && r.json.length === 7, r.json);
     check('MILK-B 为 FLAGGED',
       r.json.find((l) => l.id === MILK_B).flagged === true, r.json);
     r = await api('GET', `/api/material-lots?material_id=${MILK}`);
-    check('按原料过滤批号', r.json.length === 2 && r.json.every((l) => l.material_id === MILK), r.json);
+    check('按原料过滤批号', r.json.length === 3 && r.json.every((l) => l.material_id === MILK), r.json);
 
     // ---------- 2. 确定命中：直接投料 + 引用 + 设备残留，清洗截断 ----------
     console.log('2) 追溯 MILK-B：BATCH-002 直接投料 → BATCH-003 引用+残留；15:00 清洗后无设备残留');
