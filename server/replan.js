@@ -103,7 +103,14 @@ function normalizeChanges(rawChanges) {
       }
       const note = String(ch.note || '').trim();
       const norm = { op, event_id, type, event_time, equipment_id, note };
+      // CLEAN 更正可携带清洗范围 clean_allergens（缺省=全清；显式空集/非字符串/空白拒绝）。
+      if (type === 'CLEAN') {
+        const parsedScope = parseCleanAllergens(ch.clean_allergens, where, errors);
+        if (parsedScope === ERR_SENTINEL) return;
+        norm.clean_allergens = parsedScope;
+      }
       if (type === 'PROCESS') {
+        norm.clean_allergens = null; // 加工事件不携带清洗范围
         const batch_code = String(ch.batch_code || '').trim();
         if (!batch_code) {
           errors.push(`${where}：加工事件更正必须携带产出批次编码 batch_code`);
@@ -197,11 +204,14 @@ function normalizeChanges(rawChanges) {
       }
       seenInsertKey.add(client_key);
     }
+    const cleanAllergens = parseCleanAllergens(ch.clean_allergens, where, errors);
+    if (cleanAllergens === ERR_SENTINEL) return;
     changes.push({
       op: 'insert_clean',
       client_key,
       event_time,
       equipment_id,
+      clean_allergens: cleanAllergens,
       note: String(ch.note || '').trim()
     });
   });
@@ -214,6 +224,28 @@ function idList(v) {
   return [...new Set(
     (Array.isArray(v) ? v : []).map((x) => parseInt(x, 10)).filter(Number.isInteger)
   )];
+}
+
+// 解析 CLEAN 变更的清洗范围：undefined/null = 全清（返回 null）；
+// 非空数组 = 部分清洗（去重，返回数组）。非法（非数组、显式空集、非字符串或空白名称）
+// 追加错误并返回 ERR_SENTINEL，调用方据此终止本条变更。
+const ERR_SENTINEL = Symbol('clean_allergens_error');
+function parseCleanAllergens(raw, where, errors) {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) {
+    errors.push(`${where}：清洗范围 clean_allergens 必须是过敏原名称数组（省略该字段表示全清）`);
+    return ERR_SENTINEL;
+  }
+  if (raw.length === 0) {
+    errors.push(`${where}：清洗范围不能为空数组（显式空集表示未去除任何过敏原，应省略 clean_allergens 或按实际去除项填写）`);
+    return ERR_SENTINEL;
+  }
+  const bad = raw.filter((a) => typeof a !== 'string' || !a.trim());
+  if (bad.length) {
+    errors.push(`${where}：清洗范围中的过敏原名称必须是非空白字符串，不允许非字符串或空白名称`);
+    return ERR_SENTINEL;
+  }
+  return [...new Set(raw.map((a) => a.trim()))];
 }
 
 // 规范化排序：与提交顺序无关，保证“相同变更内容”哈希一致。
@@ -249,11 +281,15 @@ function publicChanges(changes) {
             return o;
           });
         }
+      } else if (c.type === 'CLEAN') {
+        // 清洗范围：null=全清；非空数组=部分清洗。
+        out.clean_allergens = c.clean_allergens || null;
       }
       return out;
     }
     const out = {
-      op: c.op, event_time: c.event_time, equipment_id: c.equipment_id, note: c.note
+      op: c.op, event_time: c.event_time, equipment_id: c.equipment_id, note: c.note,
+      clean_allergens: c.clean_allergens || null
     };
     if (c.client_key !== null) out.client_key = c.client_key;
     return out;
@@ -322,7 +358,7 @@ const FINGERPRINT_SQL = [
   'SELECT id, code, name, allergens FROM materials ORDER BY id',
   'SELECT id, material_id, lot_code, supplier, note, status, flagged_reason, created_at FROM material_lots ORDER BY id',
   'SELECT id, code, name FROM equipment ORDER BY id',
-  'SELECT id, event_time, type, equipment_id, batch_id, note FROM events ORDER BY id',
+  'SELECT id, event_time, type, equipment_id, batch_id, clean_allergens, note FROM events ORDER BY id',
   'SELECT id, code FROM batches ORDER BY id',
   'SELECT id, event_id, material_id, batch_id, material_lot_id FROM process_inputs ORDER BY id',
   `SELECT id, batch_id, released_at, released_by, snapshot_allergens, status,
@@ -371,6 +407,15 @@ function takeSnapshot(db) {
     last_cleaned_at: e.last_cleaned_at || null
   }));
 
+  // 最近一次 CLEAN 事件的清洗范围（null=全清）按设备回放，供差异展示“变化依据”。
+  const lastScope = new Map();
+  db.prepare(
+    `SELECT equipment_id, clean_allergens FROM events
+      WHERE type = 'CLEAN' ORDER BY event_time, id`
+  ).all().forEach((c) => lastScope.set(c.equipment_id, c.clean_allergens));
+  for (const [qid, r] of residues) r.last_clean_allergens = lastScope.get(qid) == null
+    ? null : JSON.parse(lastScope.get(qid));
+
   const releases = new Map();
   db.prepare(
     `SELECT r.id, r.batch_id, b.code AS batch_code, r.released_at, r.released_by,
@@ -416,13 +461,15 @@ function diffSnapshots(before, after) {
     a.code.localeCompare(b.code, 'zh'));
 
   // ---- 设备残留 ----
+  const scopeKey = (a) => JSON.stringify(a || null);
   const equipment_residue = [];
   for (const [id, aft] of after.residues) {
     const bef = before.residues.get(id);
     const beforeA = sortZh(bef ? bef.allergens.slice() : []);
     const afterA = sortZh(aft.allergens.slice());
     const cleanMoved = bef && bef.last_cleaned_at !== aft.last_cleaned_at;
-    if (!cleanMoved && sameSet(beforeA, afterA)) continue;
+    const scopeChanged = bef && scopeKey(bef.last_clean_allergens) !== scopeKey(aft.last_clean_allergens);
+    if (!cleanMoved && !scopeChanged && sameSet(beforeA, afterA)) continue;
     equipment_residue.push({
       equipment_id: id, equipment_code: aft.equipment_code,
       before_allergens: beforeA,
@@ -430,7 +477,10 @@ function diffSnapshots(before, after) {
       added: sortZh(afterA.filter((a) => !beforeA.includes(a))),
       removed: sortZh(beforeA.filter((a) => !afterA.includes(a))),
       before_last_cleaned_at: bef ? bef.last_cleaned_at : null,
-      after_last_cleaned_at: aft.last_cleaned_at
+      after_last_cleaned_at: aft.last_cleaned_at,
+      // 最近一次清洗的范围：null=全清；非空数组=部分清洗（仅去除列出的过敏原）。
+      before_last_clean_allergens: bef ? bef.last_clean_allergens : null,
+      after_last_clean_allergens: aft.last_clean_allergens
     });
   }
   equipment_residue.sort((a, b) => a.equipment_code.localeCompare(b.equipment_code, 'zh'));
@@ -559,10 +609,10 @@ function resolveChangeRefs(db, changes) {
 // ---------- 将变更写入给定库（影子库 或 正式事务） ----------
 function applyChangesTo(db, resolved) {
   const insEvent = db.prepare(
-    'INSERT INTO events (event_time, type, equipment_id, batch_id, note) VALUES (?,?,?,?,?)'
+    'INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note) VALUES (?,?,?,?,?,?)'
   );
   const updEvent = db.prepare(
-    'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
+    'UPDATE events SET event_time=?, equipment_id=?, note=?, clean_allergens=? WHERE id=?'
   );
   const updBatchCode = db.prepare('UPDATE batches SET code=? WHERE id=?');
   const delInputs = db.prepare('DELETE FROM process_inputs WHERE event_id=?');
@@ -587,12 +637,18 @@ function applyChangesTo(db, resolved) {
       }
       for (const bid of c.ref_batch_ids) insBatchInput.run(c.event_id, bid);
     }
-    updEvent.run(c.event_time, c.equipment_id, c.note, c.event_id);
+    // PROCESS 不携带清洗范围（恒 NULL）；CLEAN 按范围写入（null=全清，非空数组=部分清洗）。
+    const cleanJson = c.type === 'CLEAN' && Array.isArray(c.clean_allergens) && c.clean_allergens.length
+      ? JSON.stringify(c.clean_allergens) : null;
+    updEvent.run(c.event_time, c.equipment_id, c.note, cleanJson, c.event_id);
   }
   const inserted = [];
   for (const c of resolved) {
     if (c.op !== 'insert_clean') continue;
-    const id = insEvent.run(c.event_time, 'CLEAN', c.equipment_id, null, c.note).lastInsertRowid;
+    const cleanJson = Array.isArray(c.clean_allergens) && c.clean_allergens.length
+      ? JSON.stringify(c.clean_allergens) : null;
+    const id = insEvent.run(c.event_time, 'CLEAN', c.equipment_id, null, cleanJson, c.note)
+      .lastInsertRowid;
     inserted.push({ client_key: c.client_key, event_id: id });
   }
   return inserted;
@@ -615,7 +671,7 @@ function openShadow(sourceDb) {
   copy('material_lots', 'id,material_id,lot_code,supplier,note,status,flagged_reason,created_at');
   copy('equipment', 'id,code,name');
   copy('batches', 'id,code');
-  copy('events', 'id,event_time,type,equipment_id,batch_id,note');
+  copy('events', 'id,event_time,type,equipment_id,batch_id,clean_allergens,note');
   copy('process_inputs', 'id,event_id,material_id,batch_id,material_lot_id');
   copy('batch_outputs', 'batch_id,allergens,paths_json');
   copy('equipment_residue', 'equipment_id,allergens,paths_json,last_cleaned_at');

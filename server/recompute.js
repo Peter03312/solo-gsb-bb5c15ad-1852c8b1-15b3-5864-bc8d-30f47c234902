@@ -3,7 +3,9 @@
 //   加工：产出过敏原 = 原料输入 ∪ 引用批次的产出 ∪ 设备当前残留；
 //         随后设备残留更新为本次产出的过敏原（新鲜来源追加“设备残留”标记，
 //         已在残留中的路径原样保留）。
-//   已核实清洗：清空该设备残留。
+//   已核实清洗：省略清洗范围（clean_allergens 为 NULL）= 全清，清空该设备残留；
+//         部分清洗（clean_allergens 为非空过敏原数组）只清除指定过敏原的设备残留
+//         及其来源路径，其余过敏原残留原样保留并继续进入后续批次。
 // 回放后刷新派生表，并按“登记当时的过敏原集合”核对放行记录，
 // 集合不同的有效放行置为失效并记录原因；
 // 进而永久停用不再一致的标签卷，并把分配过这些停用卷的出货单置为待评估。
@@ -22,20 +24,32 @@ function addPath(map, allergen, p) {
   else set.add(TRUNC_MARK);
 }
 
-function recompute(db) {
-  const materials = new Map(
+// 解析 CLEAN 事件的清洗范围：
+//   null（字段缺省/旧事件）= 全清；
+//   否则为去重后的过敏原数组（写入侧已保证非空、名称均为非空白字符串）。
+function cleanScopeOf(rawCleanAllergens) {
+  if (rawCleanAllergens == null) return null;
+  const list = JSON.parse(rawCleanAllergens);
+  return Array.isArray(list) ? list : null;
+}
+
+// 沿事件时间线逐时回放过敏原推导（供 recompute 落库与 /api/state 展示共用）。
+// 返回 { events(含 clean_scope 与清洗后残留), residue, lastCleanAt, batchResult,
+//        materials, batches, equipment }。
+function replayTimeline(db, ctx = {}) {
+  const materials = ctx.materials || new Map(
     db.prepare('SELECT id, code, name, allergens FROM materials').all()
       .map((m) => [m.id, { ...m, allergenList: JSON.parse(m.allergens || '[]') }])
   );
-  const batches = new Map(
+  const batches = ctx.batches || new Map(
     db.prepare('SELECT id, code FROM batches').all().map((b) => [b.id, b])
   );
-  const equipment = new Map(
+  const equipment = ctx.equipment || new Map(
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
 
   const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id, note
+    `SELECT id, event_time, type, equipment_id, batch_id, note, clean_allergens
        FROM events ORDER BY event_time, id`
   ).all();
 
@@ -53,13 +67,27 @@ function recompute(db) {
 
   // 批次产出：allergen -> Set<路径>
   const batchResult = new Map();
+  const replayEvents = [];
 
   for (const ev of events) {
     const eqCode = (equipment.get(ev.equipment_id) || {}).code || `#${ev.equipment_id}`;
 
     if (ev.type === 'CLEAN') {
-      residue.set(ev.equipment_id, new Map());
+      const scope = cleanScopeOf(ev.clean_allergens);
+      if (scope === null) {
+        residue.set(ev.equipment_id, new Map());
+      } else {
+        // 部分清洗：只删除指定过敏原的残留及其来源路径，其余残留保留并继续传播。
+        const cur = residue.get(ev.equipment_id) || new Map();
+        for (const a of scope) cur.delete(a);
+      }
       lastCleanAt.set(ev.equipment_id, ev.event_time);
+      replayEvents.push({
+        ...ev,
+        clean_scope: scope,
+        post_clean_residue: [...(residue.get(ev.equipment_id) || new Map()).keys()]
+          .sort((a, b) => a.localeCompare(b, 'zh'))
+      });
       continue;
     }
 
@@ -107,7 +135,18 @@ function recompute(db) {
       newRes.set(a, next);
     }
     residue.set(ev.equipment_id, newRes);
+    replayEvents.push({ ...ev, clean_scope: null });
   }
+
+  return {
+    events: replayEvents, residue, lastCleanAt, batchResult,
+    materials, batches, equipment
+  };
+}
+
+function recompute(db) {
+  const { residue, lastCleanAt, batchResult, materials, batches, equipment } =
+    replayTimeline(db);
 
   // ---- 持久化批次推导结果 ----
   const upBatch = db.prepare(
@@ -210,4 +249,4 @@ function recompute(db) {
   return { invalidated, retiredRolls, pendingShipments, staleDispositions };
 }
 
-module.exports = { recompute, sortedJson };
+module.exports = { recompute, replayTimeline, sortedJson, cleanScopeOf };

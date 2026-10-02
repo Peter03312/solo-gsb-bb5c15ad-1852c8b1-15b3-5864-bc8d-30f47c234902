@@ -59,6 +59,11 @@ function initSchema(d) {
     type TEXT NOT NULL CHECK (type IN ('PROCESS','CLEAN')),
     equipment_id INTEGER NOT NULL REFERENCES equipment(id),
     batch_id INTEGER UNIQUE REFERENCES batches(id), -- PROCESS 时唯一
+    -- CLEAN 事件本次已核实去除的过敏原集合（JSON 字符串数组）：
+    --   NULL = 全清（既有 CLEAN 事件与旧请求省略该字段均为此语义，清空设备全部残留）；
+    --   非空数组 = 部分清洗，只清除指定过敏原的设备残留及其来源，其余残留继续进入后续批次。
+    --   显式空数组（'[]'）非法，写入时拒绝；PROCESS 事件恒为 NULL。
+    clean_allergens TEXT,
     note TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -224,6 +229,12 @@ function initSchema(d) {
     );
   }
   d.exec('CREATE INDEX IF NOT EXISTS idx_process_inputs_lot ON process_inputs(material_lot_id)');
+
+  // events.clean_allergens：CLEAN 事件本次已核实去除的过敏原集合（NULL=全清，旧事件全部保持全清语义）。
+  const eventCols = d.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
+  if (!eventCols.includes('clean_allergens')) {
+    d.exec('ALTER TABLE events ADD COLUMN clean_allergens TEXT');
+  }
 }
 
 module.exports = { getDb, initDbFile, initSchema, DB_PATH };

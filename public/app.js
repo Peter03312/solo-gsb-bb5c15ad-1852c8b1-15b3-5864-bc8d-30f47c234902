@@ -86,7 +86,13 @@ function renderResidue() {
   $('#residueCards').innerHTML = state.equipment.map((q) => `
     <div class="residue-card">
       <h4>${esc(q.name)} <span class="batch-meta">(${esc(q.code)})</span></h4>
-      <div class="residue-meta">最后已核实清洗：${q.last_cleaned_at ? esc(fmtTime(q.last_cleaned_at)) : '无记录'}</div>
+      <div class="residue-meta">最后已核实清洗：${q.last_cleaned_at ? esc(fmtTime(q.last_cleaned_at)) : '无记录'}
+        ${q.last_cleaned_at
+          ? (Array.isArray(q.last_clean_allergens) && q.last_clean_allergens.length
+            ? `（部分清洗，已去除：${esc(q.last_clean_allergens.join('、'))}）`
+            : '（全清）')
+          : ''}
+      </div>
       ${q.allergens.length
         ? `<div class="tag-row">${allergenTags(q.allergens, '')}</div>
            <details><summary>查看残留来源路径（${Object.values(q.paths).reduce((n, p) => n + p.length, 0)} 条）</summary>
@@ -346,7 +352,18 @@ function renderEvents() {
         }).join('、') : '—'}
           ｜<b>引用批次：</b>${refs.length ? refs.map((r) => esc(r.ref_batch_code)).join('、') : '—'}</div>`;
     } else {
-      body = `<div class="event-inputs"><b>已核实清洗：</b>清空设备残留${ev.note ? `｜${esc(ev.note)}` : ''}</div>`;
+      const partial = Array.isArray(ev.clean_allergens) && ev.clean_allergens.length > 0;
+      const scopeLine = partial
+        ? `<b>部分清洗：</b>已核实去除 ${allergenTags(ev.clean_allergens, '')}`
+        : `<b>已核实清洗（全清）：</b>清空设备残留`;
+      const residueLine = partial
+        ? `<div class="event-inputs"><b>清洗后残留：</b>${
+            (ev.post_clean_residue || []).length
+              ? allergenTags(ev.post_clean_residue, '') + '<span class="batch-meta">（其余残留继续进入后续批次）</span>'
+              : '<span class="tag none">无残留</span>'
+          }</div>`
+        : '';
+      body = `<div class="event-inputs">${scopeLine}${ev.note ? `｜${esc(ev.note)}` : ''}</div>${residueLine}`;
     }
     return `
     <div class="event-item ${ev.type === 'CLEAN' ? 'clean' : ''}">
@@ -418,6 +435,8 @@ function openEventModal() {
   form.event_time.value = new Date().toISOString().slice(0, 16);
   fillEventModalOptions(null);
   $('#processFields').style.display = form.type.value === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = form.type.value !== 'CLEAN';
+  syncCleanScopeInputs();
   $('#eventModal').classList.remove('hidden');
 }
 window.openEventModal = openEventModal;
@@ -429,7 +448,17 @@ $('#btnNewEventTop').onclick = () => {
 $('#eventCancel').onclick = () => $('#eventModal').classList.add('hidden');
 $('#evType').onchange = (e) => {
   $('#processFields').style.display = e.target.value === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = e.target.value !== 'CLEAN';
 };
+// 清洗范围：选“部分清洗”时才启用过敏原输入框。
+function syncCleanScopeInputs() {
+  const form = $('#eventForm');
+  if (!form.clean_mode) return;
+  $('#evCleanAllergens').disabled = form.clean_mode.value !== 'PARTIAL';
+}
+$('#cleanFields').addEventListener('change', (e) => {
+  if (e.target.name === 'clean_mode') syncCleanScopeInputs();
+});
 $('#eventForm').addEventListener('input', (e) => {
   if (e.target.name === 'event_time') refreshRefBatchOptions();
 });
@@ -527,6 +556,16 @@ window.editEvent = function (id) {
   form.note.value = ev.note || '';
   form.batch_code.value = ev.batch_code || '';
   $('#processFields').style.display = ev.type === 'PROCESS' ? 'block' : 'none';
+  $('#cleanFields').hidden = ev.type !== 'CLEAN';
+  if (ev.type === 'CLEAN') {
+    const partial = Array.isArray(ev.clean_allergens) && ev.clean_allergens.length > 0;
+    form.clean_mode.value = partial ? 'PARTIAL' : 'FULL';
+    $('#evCleanAllergens').value = partial ? ev.clean_allergens.join(',') : '';
+  } else {
+    form.clean_mode.value = 'FULL';
+    $('#evCleanAllergens').value = '';
+  }
+  syncCleanScopeInputs();
   fillEventModalOptions(ev);
   $('#eventModal').classList.remove('hidden');
 };
@@ -545,6 +584,10 @@ $('#eventForm').onsubmit = async (e) => {
       lot_id: sel && sel.value ? parseInt(sel.value, 10) : null
     });
   });
+  const isPartialClean = f.type.value === 'CLEAN' && f.clean_mode && f.clean_mode.value === 'PARTIAL';
+  const cleanAllergens = isPartialClean
+    ? [...new Set($('#evCleanAllergens').value.split(/[,，;；]/).map((s) => s.trim()).filter(Boolean))]
+    : null;
   const body = {
     event_time: f.event_time.value,
     type: f.type.value,
@@ -554,6 +597,7 @@ $('#eventForm').onsubmit = async (e) => {
     material_inputs: materialInputs,
     ref_batch_ids: $$('#evBatches input:checked').map((x) => parseInt(x.value, 10))
   };
+  if (f.type.value === 'CLEAN') body.clean_allergens = cleanAllergens;
   try {
     let r;
     if (editingEventId) {

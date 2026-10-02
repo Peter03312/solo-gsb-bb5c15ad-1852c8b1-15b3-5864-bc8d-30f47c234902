@@ -18,8 +18,8 @@ function seedIfEmpty() {
     );
     const insBatch = db.prepare('INSERT INTO batches (code) VALUES (?)');
     const insEvent = db.prepare(
-      `INSERT INTO events (event_time, type, equipment_id, batch_id, note)
-       VALUES (?,?,?,?,?)`
+      `INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note)
+       VALUES (?,?,?,?,?,?)`
     );
     const insInput = db.prepare(
       'INSERT INTO process_inputs (event_id, material_id, batch_id, material_lot_id) VALUES (?,?,?,?)'
@@ -64,9 +64,12 @@ function seedIfEmpty() {
 
     const D = '2026-09-30T';
     const process = (time, equip, bid, note) =>
-      insEvent.run(D + time, 'PROCESS', equip, bid, note).lastInsertRowid;
-    const clean = (time, equip, note) =>
-      insEvent.run(D + time, 'CLEAN', equip, null, note).lastInsertRowid;
+      insEvent.run(D + time, 'PROCESS', equip, bid, null, note).lastInsertRowid;
+    // 清洗：cleanScope 省略/null = 全清（清空该设备全部残留）；
+    //       传入非空过敏原数组 = 部分清洗（仅去除指定过敏原的设备残留与来源）。
+    const clean = (time, equip, note, cleanScope = null) =>
+      insEvent.run(D + time, 'CLEAN', equip, null,
+        cleanScope ? JSON.stringify(cleanScope) : null, note).lastInsertRowid;
     const matInput = (eid, code, lotKey = null) =>
       insInput.run(eid, mats[code], null, lotKey ? lot[lotKey] : null);
     const batchInput = (eid, code) => insInput.run(eid, null, batchIds[code], null);
@@ -91,6 +94,11 @@ function seedIfEmpty() {
     matInput(e5, 'PEANUT-01', 'PEANUT-A');
     matInput(e5, 'SOY-01');              // 酱油批号未知
 
+    // 12:30 部分清洗：仅核实去除“花生”残留；大豆/麸质残留仍在 FRYER-B 上，
+    // 会继续并入后续批次（批号追溯时，花生残留被截断、大豆批号未知仍无法排除）。
+    clean('12:30', fryerB, '部分清洗：已核实去除花生残留（大豆/麸质待班后全清）', ['花生']);
+
+    // 13:00 全清（CIP + 目视复核）：清空 FRYER-B 全部残留。
     clean('13:00', fryerB, '已核实清洗（CIP + 目视复核）');
 
     const e7 = process('14:00', fryerB, batchIds['BATCH-005'], '清洗后空白验证批');

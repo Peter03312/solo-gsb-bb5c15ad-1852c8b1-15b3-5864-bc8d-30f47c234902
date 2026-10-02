@@ -3,7 +3,7 @@ const path = require('path');
 const express = require('express');
 const { getDb } = require('./db');
 const { validateAll } = require('./validation');
-const { recompute, sortedJson } = require('./recompute');
+const { recompute, replayTimeline, sortedJson } = require('./recompute');
 const { seedIfEmpty } = require('./seed');
 const replan = require('./replan');
 const labels = require('./labels');
@@ -56,11 +56,32 @@ app.get('/api/state', (req, res) => {
     id: e.id, code: e.code, name: e.name,
     allergens: JSON.parse(e.allergens),
     paths: JSON.parse(e.paths_json),
-    last_cleaned_at: e.last_cleaned_at
+    last_cleaned_at: e.last_cleaned_at,
+    // 最近一次清洗的范围（null/缺省=全清），由下方时间线回放结果回填。
+    last_clean_allergens: null,
+    last_clean_partial: false
   }));
+
+  // 逐时回放一次：得到每次清洗的清洗范围与清洗后残留，以及设备最近一次清洗范围。
+  const replay = replayTimeline(db);
+  const cleanInfoByEvent = new Map();
+  for (const rev of replay.events) {
+    if (rev.type !== 'CLEAN') continue;
+    cleanInfoByEvent.set(rev.id, {
+      clean_allergens: rev.clean_scope,
+      partial: rev.clean_scope !== null,
+      post_clean_residue: rev.post_clean_residue
+    });
+    const q = equipment.find((x) => x.id === rev.equipment_id);
+    if (q) {
+      q.last_clean_allergens = rev.clean_scope;
+      q.last_clean_partial = rev.clean_scope !== null;
+    }
+  }
 
   const events = db.prepare(
     `SELECT ev.id, ev.event_time, ev.type, ev.equipment_id, ev.note,
+            ev.clean_allergens,
             ev.batch_id, b.code AS batch_code,
             bo.allergens AS out_allergens,
             bo.paths_json AS out_paths
@@ -76,6 +97,12 @@ app.get('/api/state', (req, res) => {
     note: ev.note,
     batch_id: ev.batch_id,
     batch_code: ev.batch_code,
+    clean_allergens: ev.clean_allergens ? JSON.parse(ev.clean_allergens) : null,
+    clean_scope_full: ev.clean_allergens == null,
+    ...(ev.type === 'CLEAN' ? {
+      clean_partial: ev.clean_allergens != null,
+      post_clean_residue: (cleanInfoByEvent.get(ev.id) || {}).post_clean_residue || []
+    } : {}),
     out_allergens: ev.out_allergens ? JSON.parse(ev.out_allergens) : [],
     out_paths: ev.out_paths ? JSON.parse(ev.out_paths) : {},
     inputs: db.prepare(
@@ -369,8 +396,13 @@ app.post('/api/events', (req, res) => {
           .run(body.batch_code).lastInsertRowid;
       }
       const eid = d.prepare(
-        'INSERT INTO events (event_time, type, equipment_id, batch_id, note) VALUES (?,?,?,?,?)'
-      ).run(body.event_time, body.type, body.equipment_id, batchId, body.note).lastInsertRowid;
+        'INSERT INTO events (event_time, type, equipment_id, batch_id, clean_allergens, note) VALUES (?,?,?,?,?,?)'
+      ).run(
+        body.event_time, body.type, body.equipment_id, batchId,
+        body.type === 'CLEAN' && body.clean_allergens
+          ? JSON.stringify(body.clean_allergens) : null,
+        body.note
+      ).lastInsertRowid;
       if (body.type === 'PROCESS') {
         for (const inp of materialInputs) {
           d.prepare(
@@ -419,8 +451,13 @@ app.put('/api/events/:id', (req, res) => {
         }
       }
       d.prepare(
-        'UPDATE events SET event_time=?, equipment_id=?, note=? WHERE id=?'
-      ).run(body.event_time, body.equipment_id, body.note, existing.id);
+        'UPDATE events SET event_time=?, equipment_id=?, note=?, clean_allergens=? WHERE id=?'
+      ).run(
+        body.event_time, body.equipment_id, body.note,
+        body.type === 'CLEAN' && body.clean_allergens
+          ? JSON.stringify(body.clean_allergens) : null,
+        existing.id
+      );
     });
     res.json({ ok: true, invalidated, retired_rolls, pending_shipments, stale_dispositions });
   } catch (err) { sendEventError(res, err); }
@@ -499,8 +536,31 @@ function normalizeEventBody(body, isUpdate = false) {
   const note = String(body.note || '').trim();
 
   const out = { type, event_time, equipment_id, note,
-    material_ids: [], material_inputs: undefined, ref_batch_ids: [] };
+    material_ids: [], material_inputs: undefined, ref_batch_ids: [],
+    clean_allergens: null };
+  if (type === 'CLEAN') {
+    // 清洗范围（本次已核实去除的过敏原集合）：
+    //   缺省/null = 全清（旧请求与既有事件语义不变）；
+    //   显式数组 = 部分清洗，只清指定过敏原；显式空集、非字符串或空白名称一律拒绝。
+    const raw = body.clean_allergens;
+    if (raw !== undefined && raw !== null) {
+      if (!Array.isArray(raw)) {
+        throw new Error('清洗范围 clean_allergens 必须是过敏原名称数组（省略该字段表示全清）');
+      }
+      const bad = raw.filter((a) => typeof a !== 'string' || !a.trim());
+      if (bad.length) {
+        throw new Error('清洗范围中的过敏原名称必须是非空白字符串，不允许显式空集或空白名称');
+      }
+      if (raw.length === 0) {
+        throw new Error('清洗范围不能为空数组：显式空集表示本次未去除任何过敏原，应省略 clean_allergens 或按实际去除项填写');
+      }
+      out.clean_allergens = [...new Set(raw.map((a) => a.trim()))];
+    }
+  }
   if (type === 'PROCESS') {
+    if (body.clean_allergens !== undefined && body.clean_allergens !== null) {
+      throw new Error('clean_allergens 清洗范围仅适用于 CLEAN 清洗事件，加工事件不携带该字段');
+    }
     const batch_code = String(body.batch_code || '').trim();
     if (!batch_code) throw new Error('产出批次编码不能为空');
     out.batch_code = batch_code;

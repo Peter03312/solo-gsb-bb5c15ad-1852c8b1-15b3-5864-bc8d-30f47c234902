@@ -4,8 +4,13 @@
 // 指定原料及供应批号（或只指定原料、查询“批号未知”），沿当前最新的合法时间线逐时传播：
 //   1) 直接投料：加工事件直接使用了该批号原料（批号未知输入单独归为“无法排除”）；
 //   2) 前序批次引用：后续加工引用了受影响批次，按引用链逐跳传播；
-//   3) 同设备未清洗残留：加工后本批号留在设备残留中，被该设备上之后、下一次已核实
-//      清洗（CLEAN）之前的每一次加工并入——已核实清洗截断设备残留。
+//   3) 同设备未清洗残留：加工后本批号留在设备残留中，被该设备上之后、下一次清洗
+//      之前的每一次加工并入。
+//      · 全清（CLEAN 省略清洗范围）截断该设备上的所有批号残留；
+//      · 部分清洗（CLEAN 显式给出已核实去除过敏原集合）只清除“来源原料的全部已登记
+//        过敏原均被本次清洗覆盖”的设备传播；尚有任一未清除过敏原时，该批号（或批号
+//        未知）的流向不能排除。来源原料未登记任何过敏原时，部分清洗无法据此排除批号，
+//        只有全清截断设备传播。
 //
 // 命中分两类，受影响对象不漏报、也不会把无法排除的对象误列为安全：
 //   CONFIRMED  确定命中：存在一条可核实的传播链，其起点是“该原料 + 该批号”的直接投料；
@@ -19,6 +24,17 @@
 const DEFAULT_PATH_LIMIT = 30;
 const MAX_PATHS = 200;
 const TRUNC_MARK = '…（传播路径过多，已截断，受影响对象本身不受截断影响）';
+
+// 无过敏原原料（如食用盐）在设备传播中的“空过敏原标签”：部分清洗无法覆盖该标签，
+// 只有全清会清除其设备传播。
+const NO_ALLERGEN_TAG = ' __NO_ALLERGEN__';
+
+// 本追溯原料的设备传播标签：其全部已登记过敏原；未登记过敏原时为 [NO_ALLERGEN_TAG]。
+// 部分清洗逐次从标签中减去已去除项，标签减空才截断该原料批号的设备传播。
+function allergenTagsFor(materialAllergens) {
+  const tags = [...new Set((materialAllergens || []).map((a) => String(a).trim()).filter(Boolean))];
+  return tags.length ? tags : [NO_ALLERGEN_TAG];
+}
 
 class TraceError extends Error {
   constructor(status, code, message, details) {
@@ -110,6 +126,13 @@ function traceMaterial(db, options) {
     }
   }
 
+  const materialAllergens = db.prepare(
+    'SELECT allergens FROM materials WHERE id = ?'
+  ).get(material_id);
+  const sourceTags = allergenTagsFor(
+    materialAllergens ? JSON.parse(materialAllergens.allergens || '[]') : []
+  );
+
   const batches = new Map(
     db.prepare('SELECT id, code FROM batches').all().map((b) => [b.id, b])
   );
@@ -117,7 +140,7 @@ function traceMaterial(db, options) {
     db.prepare('SELECT id, code, name FROM equipment').all().map((q) => [q.id, q])
   );
   const events = db.prepare(
-    `SELECT id, event_time, type, equipment_id, batch_id
+    `SELECT id, event_time, type, equipment_id, batch_id, clean_allergens
        FROM events ORDER BY event_time, id`
   ).all();
   const inputsByEvent = new Map();
@@ -131,20 +154,68 @@ function traceMaterial(db, options) {
 
   // 逐时状态
   const batchState = new Map();       // batchId -> { confirmed:bucket, unresolved:bucket, eventTime }
-  // 设备残留（仅追踪本原料）：Map<equipId, { confirmed:bucket, unresolved:bucket }>
+  // 设备残留（仅追踪本原料）：Map<equipId, { confirmed, unresolved }>
+  // 桶为 { chains:Set, truncated, tagOf:Map<chain, tags[]> }：每条设备残留链携带其
+  // 来源原料的过敏原标签，部分清洗按标签决定该链是否被去除。
+  const bucketWithTags = () => ({ chains: new Set(), truncated: false, tagOf: new Map() });
   const residue = new Map();
   for (const qid of equipment.keys()) {
-    residue.set(qid, { confirmed: bucket(), unresolved: bucket() });
+    residue.set(qid, { confirmed: bucketWithTags(), unresolved: bucketWithTags() });
   }
   const lastCleanAt = new Map();
 
   const knownBase = lot ? baseKnown(material, lot) : null;
   const unknownBase = baseUnknown(material);
 
+  // 带标签设备桶：新增链时同时记录其来源原料过敏原标签；同串链再次残留（重新沉积）
+  // 时取标签并集，恢复此前已被部分清洗清除的标签。
+  const addTagged = (b, chain, tags, limit) => {
+    addChain(b, chain, limit);
+    const prev = b.tagOf.get(chain);
+    b.tagOf.set(chain, prev ? [...new Set(prev.concat(tags))] : tags);
+  };
+  const copyTagged = (src, dst) => {
+    for (const [chain, tags] of src.tagOf.entries()) {
+      dst.chains.add(chain);
+      const prev = dst.tagOf.get(chain);
+      dst.tagOf.set(chain, prev ? [...new Set(prev.concat(tags))] : tags.slice());
+    }
+    if (src.truncated) dst.truncated = true;
+  };
+  // 部分清洗：从每条设备残留链的过敏原标签中减去本次已去除的过敏原；
+  // 标签被减空（该批号来源原料的全部已登记过敏原均已清除）才删除该链；
+  // 尚有任一未清除过敏原（NO_ALLERGEN_TAG 永远不被部分清洗减去）时链保留、批号不能排除。
+  const filterTaggedByScope = (b, scope) => {
+    const kept = bucketWithTags();
+    for (const chain of b.chains) {
+      const tags = (b.tagOf.get(chain) || sourceTags)
+        .filter((t) => t === NO_ALLERGEN_TAG || !scope.includes(t));
+      if (tags.length > 0) {
+        kept.chains.add(chain);
+        kept.tagOf.set(chain, tags);
+      }
+    }
+    kept.truncated = b.truncated && kept.chains.size > 0;
+    return kept;
+  };
+
   for (const ev of events) {
     if (ev.type === 'CLEAN') {
-      // 已核实清洗截断该设备的残留（所有原料的残留一并清空，这里只追踪本原料）。
-      residue.set(ev.equipment_id, { confirmed: bucket(), unresolved: bucket() });
+      if (ev.clean_allergens == null) {
+        // 全清：截断该设备上本原料批号的全部设备残留。
+        residue.set(ev.equipment_id, {
+          confirmed: bucketWithTags(), unresolved: bucketWithTags()
+        });
+      } else {
+        // 部分清洗：仅当来源原料的全部已登记过敏原都在本次清洗范围内才截断；
+        // 尚有任一未清除过敏原（或原料无过敏原登记）时，残留链保留、批号不能排除。
+        const scope = JSON.parse(ev.clean_allergens);
+        const cur = residue.get(ev.equipment_id);
+        residue.set(ev.equipment_id, {
+          confirmed: filterTaggedByScope(cur.confirmed, scope),
+          unresolved: filterTaggedByScope(cur.unresolved, scope)
+        });
+      }
       lastCleanAt.set(ev.equipment_id, ev.event_time);
       continue;
     }
@@ -188,22 +259,24 @@ function traceMaterial(db, options) {
     }
 
     // 设备当前残留并入产出（链原样保留：链中已带“设备残留:设备”标记）。
-    const carried = residue.get(ev.equipment_id) || { confirmed: bucket(), unresolved: bucket() };
+    const carried = residue.get(ev.equipment_id) ||
+      { confirmed: bucketWithTags(), unresolved: bucketWithTags() };
     for (const chain of carried.confirmed.chains) addChain(out.confirmed, chain, pathLimit);
     for (const chain of carried.unresolved.chains) addChain(out.unresolved, chain, pathLimit);
 
     batchState.set(ev.batch_id, { ...out, eventTime: ev.event_time, equipment_id: ev.equipment_id });
 
-    // 更新设备残留：本次新带入的链追加设备残留标记，原有残留链原样保留。
-    const nextRes = { confirmed: bucket(), unresolved: bucket() };
+    // 更新设备残留：本次新带入的链追加设备残留标记并标注来源过敏原标签；
+    // 原设备残留链（含其标签）原样保留，未被清洗清除的过敏原继续进入后续批次。
+    const nextRes = { confirmed: bucketWithTags(), unresolved: bucketWithTags() };
     for (const chain of fresh.confirmed.chains) {
-      addChain(nextRes.confirmed, `${chain} → 设备残留:${eqCode}`, pathLimit);
+      addTagged(nextRes.confirmed, `${chain} → 设备残留:${eqCode}`, sourceTags, pathLimit);
     }
-    for (const chain of carried.confirmed.chains) addChain(nextRes.confirmed, chain, pathLimit);
+    copyTagged(carried.confirmed, nextRes.confirmed);
     for (const chain of fresh.unresolved.chains) {
-      addChain(nextRes.unresolved, `${chain} → 设备残留:${eqCode}`, pathLimit);
+      addTagged(nextRes.unresolved, `${chain} → 设备残留:${eqCode}`, sourceTags, pathLimit);
     }
-    for (const chain of carried.unresolved.chains) addChain(nextRes.unresolved, chain, pathLimit);
+    copyTagged(carried.unresolved, nextRes.unresolved);
     residue.set(ev.equipment_id, nextRes);
   }
 

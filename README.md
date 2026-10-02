@@ -8,9 +8,10 @@
 此后过敏原/有效放行/停卷信息变化时旧结论保留并标需重新评估、不自动生效）。
 供应商通报某**原料供应批号**异常时，质检可按“原料 + 供应批号”做**流向追溯**：
 每次加工的原料输入可登记所属批号（同原料一次加工可用多个批号；旧事件与只传 `material_ids`
-的写入仍完全可用，其输入记为**批号未知**）；追溯沿直接投料、前序批次引用、同设备未清洗残留
-逐时传播，已核实清洗截断设备残留；结果分**确定命中**与**因批号未知无法排除**两类并给出传播依据与
-关联出货单，事件更正/删除后按最新合法时间线更新。**追溯仅供查询，不自动改变放行、卷、出货与处置结论。**
+的写入仍完全可用，其输入记为**批号未知**）；追溯沿直接投料、前序批次引用、同设备残留
+逐时传播，**全清截断全部设备残留；部分清洗按来源原料的过敏原逐项截断**（尚有未清除过敏原
+或原料无过敏原登记时不能排除批号，只有全清截断）；结果分**确定命中**与**因批号未知无法排除**
+两类并给出传播依据与关联出货单，事件更正/删除后按最新合法时间线更新。**追溯仅供查询，不自动改变放行、卷、出货与处置结论。**
 
 - 后端：Node.js + Express
 - 数据库：SQLite（[better-sqlite3](https://github.com/WiseLibs/better-sqlite3)，数据文件本地保存）
@@ -23,10 +24,16 @@
 - **批次产出过敏原** = 全部原料输入过敏原 ∪ 引用的此前批次产出 ∪ **设备当前残留**，并集计算。
 - **设备残留更新**：每次加工后，该设备残留更新为本次产出的过敏原集合；新鲜来源路径会追加“设备残留”标记，
   已在残留中的路径原样保留（可追溯残留自哪次加工带入）。
-- **已核实清洗**（CLEAN 事件）才会清空对应设备的残留；普通加工不会清空。
+- **已核实清洗**（CLEAN 事件）记录本次**已核实去除的过敏原集合**：
+  - **省略清洗范围**（不传 `clean_allergens`，既有 CLEAN 事件与旧请求均如此）= **全清**，
+    清空该设备的全部残留；
+  - **部分清洗**：`clean_allergens` 传非空过敏原名称数组，只清除这些过敏原的设备残留**及其来源路径**，
+    其余过敏原残留原样保留，继续并入该设备上清洗之后的每次加工。
+  - **显式空集、非字符串或空白名称一律拒绝**（`400`）；重复名称按一个处理。
 - 每个批次的每个过敏原都展示**来源路径链**，例如：
   `原料:全脂奶粉(MILK-01) → 批次引用:BATCH-002 → 设备残留:LINE-A`
-- 更正/删除早期事件后，系统**全量重算**所有受影响的后续批次与设备残留。
+- 更正/删除早期事件（含清洗范围变更）后，系统**全量重算**所有受影响的后续批次与设备残留，
+  并按既有规则联动放行失效、标签卷永久停用、出货单待评估与处置结论“需重新评估”。
 
 ### 放行
 
@@ -42,7 +49,85 @@
 - **同一设备同一时刻**存在多条事件（时间冲突）被拒绝。
 - 同一批次不能被两次加工产出。
 
-### 换线整组预演与确认应用（本轮新增）
+### 部分清洗（CLEAN 事件携带已核实去除过敏原集合）
+
+CLEAN 事件可记录本次**已核实去除的过敏原集合**（字段 `clean_allergens`），支持“只清指定过敏原”的部分清洗：
+
+- **省略该字段或传 `null` = 全清**：既有 CLEAN 事件与旧请求的语义完全不变（清空该设备全部残留）；旧库自动补列，历史清洗一律为全清。
+- **传非空数组 = 部分清洗**：只清除所列过敏原的设备残留及其来源路径；其余过敏原残留继续进入后续批次。数组顺序不敏感，**重复名称按一个处理**。
+- **显式空集 `[]`、任一名称为非字符串或纯空白一律拒绝**（`400 INVALID_REQUEST`）；加工事件（PROCESS）携带该字段同样拒绝。
+- 更正/删除早期清洗（全清↔部分清洗、范围调整、时间移动）后沿时间线**全量重算**，并按既有规则联动
+  **放行失效、标签卷永久停用、出货单待评估、质量处置结论需重新评估**。
+- **清洗不抹去已发生的直接投料和批次引用**：部分/全清只作用于“同设备残留”这一传播途径。
+- **供应批号追溯按来源原料涉及的过敏原保留设备传播**：
+  - 部分清洗只清除“**来源原料的全部已登记过敏原均已被去除**”的批号设备传播；
+    **尚有任一未清除过敏原时，不能排除该批号或批号未知的流向**；多次部分清洗按过敏原逐次截断（如先去“乳”再去“大豆”，两次之后才截断同时携带乳/大豆的批号残留）；
+  - **来源原料未登记过敏原时**（如食用盐），部分清洗无法据此排除批号，**只有全清截断设备传播**。
+
+### HTTP API
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `POST /api/events` / `PUT /api/events/:id` | CLEAN 事件新增/全量更正，新增可选 `clean_allergens:["花生","乳"]`；省略=`null` 即全清；非法形态 400 拒绝。响应形状不变（仍含 `invalidated`/`retired_rolls`/`pending_shipments`/`stale_dispositions`） |
+| `POST /api/replan/preview`、`POST /api/replan/apply` | `update` CLEAN 变更与 `insert_clean` 均支持同一 `clean_allergens` 形态；预演差异 `equipment_residue[]` 另含 `before/after_last_clean_allergens`（变化依据） |
+| `GET /api/state` | CLEAN 事件另含 `clean_allergens`（`null`=全清）、`clean_scope_full`、`clean_partial`、`post_clean_residue`（**清洗后残留**）；设备另含 `last_clean_allergens`/`last_clean_partial`（最近一次清洗范围） |
+
+CLEAN 请求体示例：
+
+```json
+// 部分清洗：仅核实去除“花生”（设备上其它过敏原残留保留并继续传播）
+{ "type": "CLEAN", "event_time": "2026-10-01T09:00",
+  "equipment_id": 2, "note": "换线间局部清洗：花生工位",
+  "clean_allergens": ["花生"] }
+
+// 全清（旧请求原样可用）：省略 clean_allergens
+{ "type": "CLEAN", "event_time": "2026-10-01T15:00", "equipment_id": 2, "note": "班后 CIP" }
+```
+
+#### 调用示例（curl）
+
+```bash
+# 1) 部分清洗（只去花生；重复名去重）
+curl -s -X POST http://localhost:3000/api/events \
+  -H 'Content-Type: application/json' -d '{
+    "type":"CLEAN","event_time":"2026-10-01T09:00","equipment_id":2,
+    "note":"局部清洗","clean_allergens":["花生","花生"]
+  }'
+# -> { id:..., invalidated:[...], retired_rolls:[...], pending_shipments:[...], stale_dispositions:[...] }
+
+# 2) 非法形态均拒绝（400）
+curl -s -X POST http://localhost:3000/api/events -H 'Content-Type: application/json' \
+  -d '{"type":"CLEAN","event_time":"2026-10-01T09:00","equipment_id":2,"clean_allergens":[]}'
+# -> { error:"清洗范围不能为空数组：显式空集表示本次未去除任何过敏原，…" }
+
+# 3) 页面/程序读取清洗范围、清洗后残留与变化依据
+curl -s http://localhost:3000/api/state | node -e 'let d="";process.stdin.on("data",c=>d+=c)
+  .on("end",()=>{for(const e of JSON.parse(d).events.filter(e=>e.type==="CLEAN"))
+    console.log(e.event_time, e.clean_partial ? "部分清洗 "+e.clean_allergens.join("/") : "全清",
+                "清洗后残留:", e.post_clean_residue);})'
+
+# 4) 整组换线预演：把一次全清更正为部分清洗（差异含 before/after_last_clean_allergens）
+curl -s -X POST http://localhost:3000/api/replan/preview \
+  -H 'Content-Type: application/json' -d '{
+    "changes": [
+      {"op":"update","event_id":7,"type":"CLEAN","event_time":"2026-09-30T13:00",
+       "equipment_id":2,"note":"改部分清洗","clean_allergens":["花生"]}
+    ]
+  }'
+# -> diff.equipment_residue:[{ equipment_code:"FRYER-B",
+#      before_allergens:[], after_allergens:["大豆","含麸质的谷物"], added:[...],
+#      before_last_cleaned_at:"2026-09-30T13:00", after_last_cleaned_at:"2026-09-30T13:00",
+#      before_last_clean_allergens:null, after_last_clean_allergens:["花生"] }]
+# 确认应用仍须原样回传 version 与同一份 changes（版本校验、CHANGES_MISMATCH/VERSION_EXPIRED 语义不变）。
+```
+
+| 场景 | HTTP | `code` |
+| --- | --- | --- |
+| 显式空集、非数组、名称非字符串或空白、PROCESS 携带清洗范围 | 400 | `INVALID_REQUEST` |
+| 整组预演/确认中清洗范围非法 | 400 | `INVALID_REQUEST` / `REPLAN_REJECTED` |
+| 其余事件/版本错误 | 沿用原语义 | （与既有事件、换线接口一致） |
+
+## 换线整组预演与确认应用（本轮新增）
 
 车间调整加工顺序时，可**一次提交多条既有事件的更正（PROCESS/CLEAN）与拟插入的清洗事件**：
 
@@ -496,8 +581,11 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation
 
 1. **直接投料**：加工事件直接使用了该批号原料；
 2. **前序批次引用**：后续加工引用了已命中批次，按引用链逐跳传播（可跨设备）；
-3. **同设备未清洗残留**：批号随加工留在设备残留中，被该设备**之后、下一次已核实清洗之前**
-   的每次加工并入；**已核实清洗（CLEAN）截断设备残留**。
+3. **同设备未清洗残留**：批号随加工留在设备残留中，被该设备**之后、下一次清洗之前**
+   的每次加工并入；**全清（CLEAN 省略清洗范围）截断设备残留**；**部分清洗**只清除
+   “来源原料的全部已登记过敏原均已被本次清洗去除”的设备传播——尚有任一未清除过敏原即
+   不能排除该批号/批号未知流向；来源原料无过敏原登记时部分清洗不截断，只有全清截断；
+   多次部分清洗按过敏原逐次截断。直接投料与批次引用不受任何清洗影响。
 
 结果分两类（互不重叠；受影响对象**不漏报，也不把无法排除的对象误列为安全**）：
 
@@ -540,7 +628,8 @@ curl -s http://localhost:3000/api/shipments/SHIP-0001/evaluation
 演示库已登记：全脂奶粉 `SUP-MILK-20260925-A`（正常）与 `SUP-MILK-20260926-B`（**已通报 FLAGGED**），
 `BATCH-002`(10:00, LINE-A) 同时投入这两个牛奶批号，`BATCH-003`(11:00) 引用 `BATCH-002`；
 `LABEL-0001`/`SHIP-0001` 属于 `BATCH-003`。另在 FRYER-B 上 `BATCH-004`(12:00) 投花生批号
-`SUP-PNT-20260928-3`，13:00 已核实清洗后 `BATCH-005` 为空白验证批。
+`SUP-PNT-20260928-3`，12:30 有一次**部分清洗（仅去花生）**，13:00 再做**全清**，
+之后 `BATCH-005` 为空白验证批。
 
 ```bash
 # 1) 登记一个新供应批号（也可标记供应商/备注）
@@ -601,7 +690,8 @@ curl -s 'http://localhost:3000/api/trace/material-lot?material_id=4'
 #                                  routes:{direct:true,...} } } },
 #        { batch_code:"BATCH-003", ..., shipments:[{shipment_code:"SHIP-0001",...}] } ] }
 
-# 6) 已核实清洗截断残留：花生批号只命中清洗前的 BATCH-004，BATCH-005 安全排除（两类列表都不含）
+# 6) 部分清洗（12:30 仅去花生）+ 全清（13:00）截断残留：花生批号只命中 BATCH-004，BATCH-005 安全排除
+#    （花生在 12:30 部分清洗时已被去除；若改查“大豆”，12:30 不截断，13:00 全清才截断）
 curl -s 'http://localhost:3000/api/trace/material-lot?material_id=6&lot_code=SUP-PNT-20260928-3'
 # -> confirmed_batches:["BATCH-004"]；BATCH-005 不在 confirmed 也不在 unresolved
 
@@ -658,6 +748,7 @@ npm run test:labels  # 启动临时端口的真实服务，端到端验证标签
 npm run test:shipments # 端到端验证包装出货：余额、整单事务拒绝、快照、待评估联动与换线预测
 npm run test:evaluations # 端到端验证待评估单质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估
 npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯传播（直接/引用/残留/清洗截断/未知无法排除）/更正删除更新/换线带批号/只读不改动
+npm run test:partial-clean # 端到端验证部分清洗：入参校验/只清指定过敏原/重算联动（放行/卷/出货/处置）/追溯按过敏原保留设备传播/全清与无过敏原原料/换线预演确认
 ```
 
 ## 访问地址与端口
@@ -698,7 +789,8 @@ npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯
   按整单提交**准予继续流转/召回**（操作人、依据、查询状态版本；过期拒绝、记录只增不改），
   页面可查**当前结论（含“需重新评估”标记）与全部历史**。
 - **事件时间线**：按时间排列全部加工/清洗事件，展示输入（含每个原料输入的供应批号，未知批号明确标注）、引用批次与推导结果；
-  “更正”可修改早期事件（原料可逐行选择批号，同原料可“＋ 同原料再加批号”录入多个批号），保存时整单校验并触发重算。
+  清洗事件展示**清洗范围**（全清 / 部分清洗去除的过敏原集合）与**清洗后残留**（部分清洗后仍滞留、将继续进入后续批次的过敏原）；
+  “更正”可修改早期事件（原料可逐行选择批号，同原料可“＋ 同原料再加批号”录入多个批号；清洗可切换全清/部分清洗并填写已去除过敏原），保存时整单校验并触发重算。
 - **原料批号追溯**：选择原料与供应批号（或“批号未知”）查询流向，分区展示**确定命中**与**因批号未知无法排除**
   的批次（各自传播依据链、传播方式与关联出货单）以及最后清洗后仍可能滞留批号的设备残留；可从“原料与设备”
   页的批号行一键“追溯流向”。追溯只读，不改动任何业务结论。
@@ -721,13 +813,13 @@ npm run test:trace       # 端到端验证供应批号登记/投料批号/追溯
 server/
   db.js          # SQLite 连接与表结构（导出 initSchema 供内存影子库复用）
   validation.js  # 全量校验（未来批次/循环/时间冲突/重复产出）
-  recompute.js   # 推导引擎：回放事件、批次并集、设备残留、放行核对、标签卷停用核对、出货单待评估核对
+  recompute.js   # 推导引擎：回放事件、批次并集、设备残留（全清/部分清洗按过敏原清除）、放行核对、标签卷停用核对、出货单待评估核对
   labels.js      # 过敏原标签卷：三方一致登记、按修订号核销、永久停用
   shipments.js   # 包装出货：整单事务分配、快照保存、可出货余额、待评估联动（不自动恢复）
   evaluation.js  # 待评估单质量处置：评估视图、签名状态版本、整单结论事务提交、旧结论需重评核对
   lots.js        # 原料供应批号：档案登记/标记/删除、投料批号解析（不存在/不匹配明确拒绝）
-  trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留/清洗截断）、确定命中与批号未知无法排除、关联出货单
-  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update 支持 material_inputs 带批号）
+  trace.js       # 批号流向追溯：逐时回放（直接投料/前序引用/设备残留；全清截断、部分清洗按来源过敏原逐次截断）、确定命中与批号未知无法排除、关联出货单
+  replan.js      # 整组换线：影子库预演、业务版本签名令牌、事务确认应用（update/insert_clean 支持 clean_allergens 清洗范围；update 支持 material_inputs 带批号）
   seed.js        # 首次启动演示数据（含供应批号、同原料多批号投料、一卷演示标签卷与一张演示出货单）
   server.js      # Express API 与静态页面（含 /api/material-lots、/api/trace/material-lot、/api/label-rolls、/api/shipments、/api/replan/preview|apply、/api/shipments/:id/evaluation|dispositions）
 public/
@@ -739,5 +831,6 @@ scripts/
   test-shipments.js  # 包装出货：余额/整单事务/快照/待评估联动端到端测试
   test-evaluations.js # 出货质量处置：评估视图/版本并发/CONTINUE 条件/只增不改/需重新评估端到端测试
   test-trace.js       # 供应批号与流向追溯：档案/投料批号/三路径传播/清洗截断/未知无法排除/更正删除/换线带批号/只读 端到端测试
+  test-partial-clean.js # 部分清洗：入参校验/部分清除推导/重算联动/追溯过敏原级截断/换线预演确认 端到端测试
 Dockerfile  docker-compose.yml
 ```

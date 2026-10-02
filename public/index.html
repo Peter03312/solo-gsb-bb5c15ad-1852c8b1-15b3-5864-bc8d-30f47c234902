@@ -181,6 +181,27 @@
         <label>设备 <span class="req">*</span></label>
         <select name="equipment_id" id="evEquipment" required></select>
       </div>
+      <div id="cleanFields" hidden>
+        <div class="form-row align-top">
+          <label>清洗范围（本次已核实去除）</label>
+          <div>
+            <label class="clean-mode-line">
+              <input type="radio" name="clean_mode" value="FULL" checked>
+              全清：清空该设备全部过敏原残留（旧清洗事件的默认语义）
+            </label>
+            <label class="clean-mode-line">
+              <input type="radio" name="clean_mode" value="PARTIAL">
+              部分清洗：仅清除下列过敏原的设备残留及其来源，其余残留继续进入后续批次
+            </label>
+            <input type="text" name="clean_allergens" id="evCleanAllergens"
+                   placeholder="已去除过敏原，逗号分隔，如：花生,乳" disabled>
+            <small class="hint">
+              重复名称按一个处理；必须显式填写至少一个非空白名称（空白名称与显式空集会被拒绝）。
+              部分清洗不抹去已发生的直接投料与批次引用；供应批号追溯时，来源原料尚有未清除过敏原的，其批号仍不能排除。
+            </small>
+          </div>
+        </div>
+      </div>
       <div id="processFields">
         <div class="form-row">
           <label>产出批次编码 <span class="req">*</span></label>
